@@ -1,0 +1,3996 @@
+
+#if !defined( PROFILER_H )
+
+/*
+
+# Version
+
+0.2
+
+# Description
+
+x64 instrumentation profiler for Windows and linux.
+
+At the moment it's meant to record a profile and analyse it afterward.
+
+The profiler uses the invarient timestamp counter (TSC) to get timing
+information using the rdtscp instruction. It stores streams of events called
+timelines. Each event is 16 bytes: 8 for the TSC, 4 for the event ID and 4 for
+the event flags. To capture a time interval, you need 1 start and 1 end event.
+
+A profile contains two main part: the meta data, and the event streams. The meta
+data contains information about ids, id strings and how to convert TSC to time.
+Event streams are just events one after the other.
+
+After a profile has been captured, functions are available to convert the TSC to
+time. Those functions try to emulate what the operating system function does to
+convert from TSC to time (QueryPerformanceCounter on Windows,
+clock_gettime( CLOCK_MONOTONIC ) on linux). A fallback method is also available
+that might provide less precise results, but should always work.
+
+NOTE simon: This might be a better way to do it.
+https://gist.github.com/pmttavara/6f06fc5c7679c07375483b06bb77430c
+
+The ID used by the profiler are 32 bits unsigned integer known at compile time.
+A separate tool (id_generator.exe) is provided to generate an enumeration and
+the corresponding strings for printout into a header file (profiler_ids.h by
+default). Use id_generator -h for more information.
+
+To inspect a recorded profile, the header provides functions to create a
+profiler_tool_t that creates a node tree for each timelines as well as a summary
+of where the time is spent in each timeline (profiler_totals_t).
+
+
+# Getting started
+
+- Define PROFILER_ON before including this header and the id header, in ALL
+  translation units;
+- Define PROFILER_IMPLEMENTATION before including this header and the id header,
+  in exactly ONE translation unit;
+- Include profiler_ids.h;
+- Include profiler.h;
+
+- call profiler_initialize once, before any profiler_timeline_initialize call;
+- call profiler_timeline_initialize in any thread that hasn't called
+  profiler_initialize and wants to record events;
+- call any number of profiler_event_start and the matching profiler_event_end;
+- call profiler_finalize when you're done;
+- call profiler_write_to_file to save the to a file.
+- or/and call profiler_print_from_session to get a print out of the profile.
+
+- call id_generator.exe to generate the id file (profiler_ids.h by default).
+  Hopefully this is fast enough that you can always call it before compiling.
+- Compile and run your code normally.
+
+
+- profiler_initialize and profiler_timeline_initialize take a number of event as
+  a parameter. That number is use to reserve memory for the events at
+  initialization time. The profiler will not grow that memory. So choose a
+  appropriate value. An event is 16 bytes so if you reserve 1 million events it
+  will take 16 MB of memory. Keep in mind that events are used in pair, so if
+  you want 1 million time intervals you need 2 millions events. If you run out
+  of memory the profiler will most likely crash (or trigger an assert if
+  PROFILER_ASSERT is defined).
+
+- Before wrting the profile to a file, or printing it, make sure no more events
+  are added and that all events have been closed in all timelines;
+
+- id_generator.exe does a simple text search for "profiler_event_start",
+  "profiler_event_end", "profiler_collapsable_start" and
+  "profiler_collapsable_end", so it will still pick up ids from comments or
+  "#if 0" text.
+- If you use the header only to analyse a previously recorded profile, you don't
+  need to define PROFILER_ON and don't need to include profiler_ids.h.
+- If you want to disable the profiler without modifying the code, you can remove
+  the PROFILER_ON define. All calls should be replaced by empty macros or return
+  0.
+- When first adding the profiler to your code, you can define PROFILER_DEBUG or
+  PROFILER_ASSERT before including profiler.h to help you set it up.
+  PROFILER_DEBUG will define PROFILER_ASSERT if it's not already defined.
+- PROFILER_DEBUG will trigger an assert when you call profiler_finalize if the
+  number of event started doesn't match the number of event ended, and should
+  give you an indication of the id that triggered the assert.
+- PROFILER_ASSERT is mostly used internally to detect unexpected things. But for
+  users it can help detect running out of events memory and recursive
+  profiler_collapsable calls.
+- By default the profiler can create 128 timelines. If you want more you can
+  define PROFILER_MAX_TIMELINE_COUNT to the value you want.
+- By default the number of collapsable events is set to 60. If you want more you
+  can define PROFILER_MAX_COLLAPSABLE_COUNT to the value you want.
+- There are two event ids required for the profiler to work, they are always
+  generated by the id_generator:
+  - profiler_event_id_profiler_collapse: needs to have a value of 0 and is used
+    to keep track of the time use to callpse events;
+  - profiler_event_id_profiler_not_measured: needs to have a value of 1 and is
+    used to keep track of time that isn't spent in an event childs.
+
+
+# Error handling
+
+Functions that can fail take a pointer to a 32 bits unsigned integer as their
+last parameter to store error codes. 0 always means no error, and the value must
+be initialized to zero before the first call. Any function that has an error
+parameter will check that the error value is 0 before doing anything, so it's
+safe to call functions without checking the error code between each call.
+
+Error code are defined in the profiler_error_t enum.
+
+# Small examples
+
+*/
+
+#if 0
+
+#define PROFILER_ON
+#define PROFILER_IMPLEMENTATION
+#include "profiler_ids.h"
+#include "profiler.h"
+
+#include <stdint.h>
+
+int main( int argc, char** argv ) {
+    uint32_t error = 0;
+    profiler_initialize( main, 2, &error );
+    profiler_event_start( test_event );
+    // Do something here.
+    profiler_event_end( test_event );
+    profiler_finalize( );
+    error = 0;
+    profiler_write_to_file( "profile.bin", 1, &error );
+    return 0;
+}
+
+#endif
+
+#if 0
+
+#define PROFILER_IMPLEMENTATION
+#include "profiler.h"
+
+#include <stdio.h>
+#include <stdint.h>
+
+int main( int argc, char** argv ) {
+    
+    FILE* file = fopen( "profile.bin", "rb" );
+    fseek( file, 0, SEEK_END );
+    size_t file_size = ftell( file );
+    fseek( file, 0, SEEK_SET );
+    
+    uint8_t* buffer = ( uint8_t* ) malloc( file_size );
+    fread( buffer, file_size, 1, file );
+    fclose( file );
+    
+    uint32_t error = 0;
+    profiler_tool_t tool = profiler_tool_initialize_from_file( buffer, file_size, 0, 0, &error );
+    free( buffer );
+    
+    uint8_t* out = ( uint8_t* ) malloc( 1024 * 1024 );
+    uintptr_t out_size = profiler_print_from_tool( &tool, out, 1024 * 1024, &error );
+    printf( "%.*s\n", ( int ) out_size, out );
+    free( out );
+    
+    return 0;
+}
+
+#endif
+
+/*
+# Types
+*/
+
+#include <stdint.h>
+
+typedef struct profiler_buffer_t {
+    uintptr_t reserved;
+    uintptr_t used;
+    uint8_t* bytes;
+} profiler_buffer_t;
+
+typedef enum profiler_event_flag_t {
+    profiler_event_flag_none = 0,
+    profiler_event_flag_start = 1 << 0,
+    profiler_event_flag_end = 1 << 1,
+    profiler_event_flag_collapsable = 1 << 2,
+    profiler_event_flag_collapsed = 1 << 3,
+} profiler_event_flag_t;
+
+typedef struct profiler_event_t {
+    uint64_t cycles;
+    uint32_t id;
+    uint32_t flags;
+} profiler_event_t;
+
+typedef struct profiler_node_t {
+    uint32_t id;
+    uint32_t flags;
+    uint32_t child_count;
+    struct profiler_node_t* parent;
+    struct profiler_node_t* next_sibling;
+    struct profiler_node_t* first_child;
+    struct profiler_node_t* last_child;
+    uint64_t start_cycles;
+    uint64_t end_cycles;
+    uint64_t childs_cycles;
+    uint64_t start_time;
+    uint64_t end_time;
+    uint64_t childs_time;
+    void* user_data;
+} profiler_node_t;
+
+/*
+NOTE simon: Each pointer field contains profiler_tool_t.event_id_count elements,
+wich should be copied in maximum_element_count during initialization.
+*/
+typedef struct profiler_totals_t {
+    profiler_buffer_t memory;
+    profiler_node_t** in_parent;
+    uint64_t* cycles;
+    uint64_t* not_measured_cycles;
+    uint64_t* time;
+    uint64_t* not_measured_time;
+    uint64_t* hits;
+    uint32_t* id;
+    uint32_t maximum_element_count;
+    uint32_t element_count;
+} profiler_totals_t;
+
+typedef enum profiler_platform_t {
+    profiler_platform_fallback,
+    profiler_platform_windows,
+    profiler_platform_linux,
+} profiler_platform_t;
+
+typedef enum profiler_windows_version_t {
+    profiler_windows_version_7,
+    profiler_windows_version_8, /* NOTE simon: 8 to 10 v1067 */
+    profiler_windows_version_10,
+} profiler_windows_version_t;
+
+typedef struct profiler_platform_data_t {
+    
+    struct {
+        uint8_t version;
+        uint8_t qpc_shift;
+        uint64_t qpc_bias;
+        /* NOTE simon: Version of windows 10 after v1067 use those values. */
+        uint64_t mul128;
+        uint64_t add;
+    } windows;
+    
+    struct {
+        uint32_t mult;
+        uint32_t shift;
+    } linux_;
+    
+} profiler_platform_data_t;
+
+typedef struct profiler_tool_t {
+    
+    profiler_buffer_t memory;
+    uint32_t print_event_id_width;
+    uint32_t max_event_id_string_length;
+    uint32_t max_timeline_id_string_length;
+    uint64_t max_cycles;
+    uint64_t max_time;
+    uint16_t print_cycles_size;
+    uint16_t print_time_integer_size;
+    uint32_t indent_space_count;
+    
+    uint64_t frequency;
+    uint64_t fallback_cycles;
+    uint64_t fallback_time;
+    
+    uint8_t platform;
+    profiler_platform_data_t platform_data;
+    
+    uint32_t timeline_id_count;
+    uint8_t** timeline_id_strings;
+    uint16_t* timeline_id_string_lengths;
+    
+    uint32_t event_id_count;
+    uint8_t** event_id_strings;
+    uint16_t* event_id_string_lengths;
+    
+    uint32_t timeline_count;
+    uint64_t* timeline_sizes;
+    profiler_node_t** timelines;
+    profiler_buffer_t* timelines_memory;
+    uint32_t* timeline_ids;
+    profiler_totals_t* totals;
+    
+} profiler_tool_t;
+
+typedef struct profiler_event_range_t {
+    uint64_t start_cycles, end_cycles;
+    uint64_t start_time, end_time;
+} profiler_event_range_t;
+
+typedef struct profiler_node_iterator_t {
+    profiler_node_t* root;
+    profiler_node_t* current;
+} profiler_node_iterator_t;
+
+typedef enum profiler_error_t {
+    
+    profiler_error_none,
+    
+    profiler_error_buffer_make_null_pointer,
+    profiler_error_buffer_not_enough_memory,
+    profiler_error_get_memory_failed,
+    profiler_error_file_creation_failed,
+    profiler_error_file_invalid_signature,
+    profiler_error_file_unsupported_version,
+    profiler_error_file_writing_failed,
+    profiler_error_file_writing_incomplete,
+    
+    profiler_error_count
+        
+} profiler_error_t;
+
+typedef enum profiler_sort_flag {
+    profiler_sort_descending = 0 << 0,
+    profiler_sort_ascending = 1 <<  0,
+} profiler_sort_flag;
+
+typedef enum profiler_totals_flag_t {
+    profiler_totals_none = 0 << 0,
+    profiler_totals_recursive = 1 << 0,
+} profiler_totals_flag_t;
+
+typedef enum profiler_hexadecimal_format_t {
+    
+    profiler_hf_off = 0,
+    profiler_hf_on = 1 << 0,
+    profiler_hf_no_prefix = 1 << 1,
+    
+} profiler_hexadecimal_format_t;
+
+typedef enum profiler_enable_flag_t {
+    profiler_enable_all = 0,
+    profiler_enable_event = 1 << 0,
+    profiler_enable_collapsable = 1 << 1,
+} profiler_enable_flag_t;
+
+#if defined( PROFILER_ON )
+
+#ifndef PROFILER_MAX_COLLAPSABLE_COUNT
+#define PROFILER_MAX_COLLAPSABLE_COUNT 60
+#endif
+
+#ifndef PROFILER_MAX_TIMELINE_COUNT
+#define PROFILER_MAX_TIMELINE_COUNT 128
+#endif
+
+typedef profiler_event_t* profiler_create_event_t( profiler_event_id_t id, uint32_t flags );
+typedef profiler_event_t* profiler_create_collapsable_t( profiler_event_id_t id );
+
+typedef struct profiler_timeline_t {
+    
+    profiler_event_t* start;
+    profiler_event_t* current;
+    profiler_event_t* end;
+    profiler_event_t* collapsable_start[ PROFILER_MAX_COLLAPSABLE_COUNT ];
+    profiler_event_t* collapsable_end[ PROFILER_MAX_COLLAPSABLE_COUNT ];
+    uintptr_t collapsable_index;
+    uint32_t in_collapsable_event;
+    uint32_t id;
+    profiler_create_event_t* event_start_function;
+    profiler_create_event_t* event_end_function;
+    profiler_create_collapsable_t* collapsable_start_function;
+    profiler_create_collapsable_t* collapsable_end_function;
+    
+#if defined( PROFILER_DEBUG )
+    uint32_t* pair_check;
+#endif
+    
+} profiler_timeline_t;
+
+typedef struct profiler_state_t {
+    
+    profiler_timeline_t timelines[ PROFILER_MAX_TIMELINE_COUNT ];
+    volatile uint32_t timeline_count;
+    uint32_t events_get_index;
+    uint32_t is_initialized;
+    uint32_t id_count;
+    uint32_t timeline_id_count;
+    uint64_t frequency;
+    uint64_t fallback_cycles;
+    uint64_t fallback_time;
+    uint8_t platform;
+    profiler_platform_data_t platform_data;
+    
+} profiler_state_t;
+
+#endif
+
+/* # API */
+
+/*
+Creates a memory buffer. Doesn't allocated memory, it just fill a
+profiler_buffer_t structure with the arguments passed.
+
+Errors:
+- profiler_error_buffer_make_null_pointer if "bytes" is 0.
+*/
+profiler_buffer_t profiler_buffer_make( uintptr_t reserved, uintptr_t used, void* bytes, uint32_t* error );
+
+
+/*
+Get the event id corresponding to the given string.
+*/
+#define profiler_get_event_id_from_name_l( tool, literal ) profiler_get_event_id_from_name_p( ( tool ), ( literal ), sizeof( literal ) - 1 )
+uint32_t profiler_get_event_id_from_name_p( profiler_tool_t* tool, void* string, uintptr_t length );
+
+
+/*
+Convert the TSC "cycles" to a time value using the fallback method.
+
+For the fallback method to work, you need to have called profiler_finalize at
+the end of the profile recording.
+
+The value returned needs to be divided (in floating point) by
+profiler_tool_t.frequency to get a value in seconds.
+
+It is important to pass raw cycles value, and NOT an addition/subtraction of
+cycles.
+*/
+uint64_t profiler_cycles_to_time_fallback( profiler_tool_t* tool, uint64_t cycles );
+
+
+/*
+Convert the TSC "cycles" to a time value by trying to emulate the operating
+system function (based on which operating system the profile was recorded on):
+- on Windows this is QueryPerformanceCounter (different versions of it depending
+  on the Windows version).
+- on linux this is clock_gettime( CLOCK_MONOTONIC ).
+
+If profiler_tool_t.platform isn't set to profiler_platform_windows or
+profiler_platform_linux, the fallback method will be used.
+
+The value returned needs to be divided (in floating point) by
+profiler_tool_t.frequency to get a value in seconds.
+
+It is important to pass raw cycles value, and NOT an addition/subtraction of
+cycles.
+*/
+uint64_t profiler_cycles_to_time( profiler_tool_t* tool, uint64_t cycles );
+
+
+/*
+Query whether a node is the root of the tree.
+
+Returns 1 if the node is the root, 0 otherwise.
+*/
+uint32_t profiler_node_is_root( profiler_node_t* node );
+
+
+/*
+Get the root of the tree of which node is part of.
+
+Returns 0 if node is 0, the root of the tree otherwise.
+*/
+profiler_node_t* profiler_timeline_get_root_from_node( profiler_node_t* node );
+
+
+/*
+Pushes a textual representation of "node" in "buffer".
+
+Errors:
+- profiler_error_buffer_not_enough_memory: there wasn't enough space in
+  "buffer". "buffer" can contain an unfinished print out. It's safe to continue
+  and error can be cleared.
+*/
+void profiler_print_node( profiler_tool_t* tool, profiler_buffer_t* buffer, profiler_node_t* node, uintptr_t indent_level, uint32_t* error );
+
+
+/*
+Initialize "totals" and allocate the necessary memory.
+
+profiler_totals_t is used to measure how much time is spent in each events. It
+contains arrays for cycles, time and hits, as well as the amount of cycles and
+time not accounted for. For example, if event A contains event B but B takes only 50% of the time of A,
+the "not_measured" arrays will contains 50% for event A. Unless
+profiler_totals_compact or profiler_totals_sort as been called, you can index
+the arrays using event ids. Otherwise you need to use the totals->id array to
+know which id is associated with the index.
+
+Errors
+- profiler_error_get_memory_failed:the memory allocation failed. You should not
+  use "totals" if the error is set. The amount of memory that was requested can
+  be read from totals->memory.reserved. No memory was allocated. It's safe to
+  clear the error and try again.
+
+  If PROFILER_ASSERT is defined, all fields from the totals->memory structure
+  must be set to zero before calling this function.
+*/
+void profiler_totals_initialize( profiler_tool_t* tool, profiler_totals_t* totals, uint32_t* error );
+
+
+/*
+Use this function to reuse a totals.
+
+This will reset all fields, but will keep the memory. You must not call
+profiler_totals_initialize after this.
+*/
+void profiler_totals_reset( profiler_totals_t* totals );
+
+
+/*
+Free the memory used by "totals" and set all fields to zero.
+*/
+void profiler_totals_free( profiler_totals_t* totals );
+
+
+/*
+Goes through all child nodes of "node" and builds "totals" arrays.
+
+You need to call profiler_totals_initialize before this.
+If "flags" is set to profiler_totals_recursive it will recursively go into all
+nodes in the tree lower than node.
+*/
+void profiler_totals_build( profiler_totals_t* totals, profiler_node_t* node, uint32_t flags );
+
+
+/*
+Count the number of events with time spent in them (how many element in the
+cycles arrays are not zero).
+*/
+uint32_t profiler_totals_get_element_count( profiler_totals_t* totals );
+
+
+/*
+Move elements in the "totals"'s arrays so that all events with time are at the
+beginning of the arrays.
+
+After calling this, you need to use totals->id[ index ] to know to which event
+id each index in the arrays correspond to.
+*/
+void profiler_totals_compact( profiler_totals_t* totals );
+
+
+/*
+Goes through all child nodes of "node" and builds "totals" arrays, only using
+events that are in the time range defined by "range".
+
+You need to call profiler_totals_initialize before this.
+If an event is not entierly in range, only the part that overlaps the range is
+used.
+If "flags" is set to profiler_totals_recursive it will recursively go into all
+node in the tree lower than "node".
+*/
+void profiler_totals_build_in_range( profiler_totals_t* totals, profiler_node_t* node, uint32_t flags, profiler_event_range_t range );
+
+
+/*
+Sort "totals"'s arrays based on the cycles array values.
+
+The sort is descending by default, set flags to profiler_sort_ascending to use
+ascending instead.
+
+After calling this, you need to use totals->id[ index ] to know to which event
+id each index in the arrays correspond to.
+
+If a lot of events aren't use, it might be worth it to call
+profiler_totals_compact first to have less events to sort.
+*/
+void profiler_totals_sort( profiler_totals_t* totals, uint32_t flags );
+
+
+/*
+Transforms an event stream into a node tree.
+
+- "tool" needs to be initialized by calling any of the
+  profiler_tool_initialize_* functions before calling this function.
+- "events" is an event stream retrieved using profiler_events_get_first,
+  profiler_events_get_next or from a previous profile. The stream should be
+  valid, meaning all opened events have been closed.
+- "user_data_init" and "user_data_size" are used to add some user data to the
+  tree. If "user_data_size" isn't zero, "user_data_size" bytes will be allocated
+  for each node and initialized with a copy of the bytes pointed by
+  "user_data_init". Each node has a pointer to the data in the user_data member.
+- "tree_memory" is a pointer to a profiler_buffer_t that will contain the
+  information about the memory allocated by the function. It can't be zero.
+- "totals" is a pointer to a profiler_totals_t to build the totals arrays while
+  building the tree. It can be zero if "totals" isn't needed. If not zero,
+  totals shouldn't be initialized before calling this function.
+
+Errors:
+- profiler_error_get_memory_failed: the allocation for the tree memory failed or
+  the allocation for the totals failed. If the error is set, the function will
+  free any memory it allocated. It's safe to clear the error and try again.
+
+The function will return 0 if there is an error, otherwise the tree root node.
+The root node doesn't represent an event, it's a "directory" of the top level
+events. It mostly means that you shouldn't use its id, but other fields should
+work as expected.
+*/
+profiler_node_t* profiler_build_tree( profiler_tool_t* tool, void* events, uintptr_t event_size, void* user_data_init, uintptr_t user_data_size, profiler_buffer_t* tree_memory, profiler_totals_t* totals, uint32_t* error );
+
+
+/*
+Initialize the meta data part of the profiler_tool_t based on the meta data part
+of a profile.
+
+You can get the meta data by calling profiler_meta_get_from_session when
+recording a profile or by reading it from a saved profile.
+
+Errors:
+- profiler_error_buffer_make_null_pointer: if meta is 0;
+- profiler_error_get_memory_failed: the memory allocation failed;
+- profiler_error_buffer_not_enough_memory: "meta" didn't contain enough bytes to
+  read. The allocated memory is freed by the function;
+In any of those 3 errors, it's safe to clear the error and try again.
+*/
+void profiler_tool_initialize_meta( profiler_tool_t* tool, void* meta, uintptr_t meta_size, uint32_t* error );
+
+
+/*
+Creates a profiler_tool_t from a complete profile file.
+
+It initializes the meta data part of the profiler tool and creates a node tree
+and totals arrays for each timelines.
+
+"user_data_init" and "user_data_size" are used to add some user data to the
+tree. If "user_data_size" isn't zero, "user_data_size" bytes will be allocated
+for each node and initialized with a copy of the bytes pointed by
+"user_data_init". Each node has a pointer to the data in the user_data member.
+
+Errors:
+- profiler_error_buffer_make_null_pointer: if profile is 0.
+- profiler_error_buffer_not_enough_memory: the file doesn't contain enough bytes
+  to read.
+- profiler_error_file_invalid_signature: the file doesn't contains the signature
+  "PROF" as the first 4 bytes of the file.
+- profiler_error_file_unsupported_version: the file version isn't supported
+  (only 0x00000001 is valid at the moment).
+- profiler_error_get_memory_failed: a memory allocation failed
+In case of error it's safe to clear the error and try again, but it's not safe
+to use the returned profiler_tool_t.
+*/
+profiler_tool_t profiler_tool_initialize_from_file( void* profile, uintptr_t profile_size, void* user_data_init, uintptr_t user_data_size, uint32_t* error );
+
+
+/*
+Free memory used to store timelines and totals (all memory used by
+profiler_tool_t) and sets all fields to 0.
+*/
+void profiler_tool_free_memory( profiler_tool_t* tool );
+
+
+/*
+Pushes a textual representation of the timeline's totals and node tree in
+buffer.
+
+Returns the number of bytes pushed in the buffer.
+
+Errors:
+- profiler_error_buffer_make_null_pointer: if buffer is 0.
+- profiler_error_buffer_not_enough_memory: if size isn't enough to store the
+  full printout. The printout is incomplete, but the returned value contains the
+  number of bytes used.
+In case of error it's safe to clear the error and try again.
+*/
+uintptr_t profiler_print_timeline( profiler_tool_t* tool, uintptr_t timeline_index, void* buffer, uintptr_t size, uint32_t* error );
+
+
+/*
+Pushes a textual representation of all timelines totals and node tree contained
+in "tool" into "buffer".
+
+Returns the number of bytes pushed in the buffer.
+
+Error:
+- profiler_error_buffer_make_null_pointer: if buffer is 0.
+- profiler_error_buffer_not_enough_memory: if size isn't enough to store the
+  full printout. The printout is incomplete, but the returned value contains the
+  number of bytes used.
+In case of error it's safe to clear the error code and try again.
+*/
+uintptr_t profiler_print_from_tool( profiler_tool_t* tool, void* buffer, uintptr_t size, uint32_t* error );
+
+
+/*
+Searches for an event with the given id, searching for siblings first and then
+childs.
+*/
+profiler_node_t* profiler_node_find_breadth_first( profiler_node_t* current, uintptr_t id );
+
+
+/*
+Searches for an event with the given id, searching for childs first then
+siblings.
+*/
+profiler_node_t* profiler_node_find_depth_first( profiler_node_t* current, uintptr_t id );
+
+
+/*
+Create a node iterator to traverse the tree.
+
+"root" can be any node, and the iterator will only iterate node below that.
+*/
+profiler_node_iterator_t profiler_node_iterator_make( profiler_node_t* root );
+
+
+/*
+Advance the iterator, going for childs first, then siblings.
+*/
+profiler_node_t* profiler_node_iterator_next_depth_first( profiler_node_iterator_t* iterator );
+
+
+/*
+Advance the iterator, going for siblings first, then childs.
+*/
+profiler_node_t* profiler_node_iterator_next_breadth_first( profiler_node_iterator_t* iterator );
+
+
+#if defined( PROFILER_ON )
+
+
+/*
+Get the time update frequency in Hz.
+
+You need to devide time values by the frequency to get a time in seconds.
+- QueryPerformanceFrequency on Windows;
+- 1000000000 on linux as clock_gettime returns values with nano seconds
+  precision.
+*/
+void profiler_get_frequency( uint64_t* frequency );
+
+
+/*
+Get a time value.
+
+You need to divide this value by the frequency to get a time in seconds.
+- QueryPerformanceCounter of Windows;
+- clock_gettime( CLOCK_MONOTONIC ) on linux;
+*/
+void profiler_get_time( uint64_t* time );
+
+
+/*
+Get the current TSC value.
+
+This is a rdtscp instruction.
+*/
+uint64_t profiler_get_cycles( void );
+
+
+/*
+Initialize a timeline in the current thread.
+
+profiler_initialize must have been called before any call to
+profiler_timeline_initialize. The thread that calls profiler_initialize must not
+call profiler_timeline_initialize. This will allocate maximum_event_count * 16
+bytes of memory for the timeline.
+
+Errors:
+- profiler_error_get_memory_failed: the memory allocation failed. No memory was
+  allocated. If this error is set, it's not safe to use any of the event
+  creation functions in this thread and those functions will be set to "no op"
+  in this thread. The error can be cleared, and the function can be called
+  again, but it will leave an empty timeline in the profiler global state.
+*/
+#define profiler_timeline_initialize( name, max_event_count, error ) profiler_timeline_initialize_function( profiler_timeline_id_##name, ( max_event_count ), ( error ) )
+void profiler_timeline_initialize_( uint32_t id, uintptr_t maximum_event_count, uint32_t* error );
+typedef void profiler_timeline_initialize_t( uint32_t id, uintptr_t maximum_event_count, uint32_t* error );
+
+/*
+Initialize the profiler global state.
+
+This need to be called only once, before any call to
+profiler_timeline_initialize. This function will call
+profiler_timeline_initialize for the current thread, so you must not call it
+yourself.
+
+Errors:
+- profiler_error_get_memory_failed: the memory allocation failed. No memory was
+  allocated. If this error is set, it's not safe to use any of the event
+  creation functions in this thread and those functions will be set to "no op"
+  in this thread. This error comes directly from profiler_initialize_timeline,
+  so you can clear the error and call profiler_initialize_timeline (NOT
+  profiler_initialize), but it will leave an empty timeline in the profiler
+  global state.
+*/
+#define profiler_initialize( name, main_thread_max_event_count, error ) profiler_initialize_function( profiler_timeline_id_##name, ( main_thread_max_event_count ), ( error ) )
+void profiler_initialize_( uint32_t id, uintptr_t main_thread_max_event_count, uint32_t* error );
+typedef void profiler_initialize_t( uint32_t id, uintptr_t main_thread_max_event_count, uint32_t* error );
+
+
+/*
+profiler_finalize is in theory an optional call, but it's required for the
+fallback method to work. If PROFILER_DEBUG is defined, the function will verify
+that the number of closed event is equal to the number of opened event for each
+event id and for each timeline.
+*/
+#define profiler_finalize( ) profiler_finalize_function( )
+void profiler_finalize_( void );
+typedef void profiler_finalize_t( void );
+
+
+/*
+Free all timelines memory.
+
+This call can be left out and let the OS free the memory on application
+shutdown. You shouldn't create any more event in any timelines after this call.
+*/
+#define profiler_cleanup( ) profiler_cleanup_function( )
+void profiler_cleanup_( void );
+typedef void profiler_cleanup_t( void );
+
+
+/*
+Set the id of the timeline associated with the current thread.
+*/
+#define profiler_timeline_set_id( name ) profiler_timeline_set_id_( profiler_timeline_id_##name )
+void profiler_timeline_set_id_( uint32_t id );
+
+
+/*
+Sets the id for the timeline at "index" in the global state.
+
+This allows to set any timeline id from any thread. There is no verification to
+see if concurent call are changing the value at the same time.
+*/
+#define profiler_timeline_set_id_for_index( name, index ) profiler_timeline_set_id_for_index_( profiler_timeline_id_##name, index )
+void profiler_timeline_set_id_for_index_( uint32_t id, uintptr_t index );
+
+/*
+Internal plumbing to disable profiler calls.
+*/
+profiler_event_t* profiler_event_no_op( profiler_event_id_t id, uint32_t flags );
+profiler_event_t* profiler_collapsable_no_op( profiler_event_id_t id );
+
+/*
+Internal plumbing to disable the profiler at runtime.
+*/
+void profiler_timeline_initialize_disabled( uint32_t id, uintptr_t maximum_event_count, uint32_t* error );
+void profiler_initialize_disabled( uint32_t id, uintptr_t main_thread_max_event_count, uint32_t* error );
+void profiler_finalize_no_op( );
+void profiler_cleanup_no_op( );
+
+/*
+Starts an event.
+
+An event can contain any number of other events, and can contain events with the
+same id. A matching profiler_event_end call must be made. Any child event must
+be closed before its parent is closed.
+
+Meaning you can't do:
+profiler_event_start( A );
+profiler_event_start( B );
+profiler_event_end( A );
+profiler_event_end( B );
+
+There are no checks to see if there are still free events in the timeline. If
+PROFILER_ASSERT is defined, an assert will trigger if there is no more free
+event in the timeline, otherwise it will most likely crash.
+
+Return the address of the new event.
+*/
+#define profiler_event_start( name ) profiler_timeline->event_start_function( profiler_event_id_##name, profiler_event_flag_start )
+profiler_event_t* profiler_event_start_( profiler_event_id_t id, uint32_t flags );
+
+
+/*
+Ends an event.
+
+A matching profiler_event_start must be called before.
+
+There are no checks to see if there are still free events in the timeline. If
+PROFILER_ASSERT is defined, an assert will trigger if there is no more free
+event in the timeline, otherwise it will most likely crash.
+*/
+#define profiler_event_end( name ) profiler_timeline->event_end_function( profiler_event_id_##name, profiler_event_flag_end )
+profiler_event_t* profiler_event_end_( profiler_event_id_t id, uint32_t flags );
+
+
+/*
+Starts a collapsable event.
+
+Collapsable events are events which childs can be removed from the profile to
+save memory. For example in a game, you may want to only keep the 60 last frame
+of the profile, so you use a collapsable event as the root event of each frame,
+and when 60 frames are recorded, the next event will erase the first frame.
+
+- Needs to have a matching profiler_collapsable_end.
+- A collapsable event can't contain an other collapsable event.
+- The collapsing of an event is a simple memory move of every events that
+  follows it in the timeline, which is really slow if there are a lot of events
+  in the timeline (it will copy 60 frames worth of event each time an event is
+  collapsed). Hopefully I'll find a better way to to a similar thing.
+- When an event is collapsed, a profiler_collapse event is added in the stream
+  to measure the time taken by the memory move.
+- profiler_collapsable_start is the function that collapse the events (does the
+  memory move).
+- Collapsable events are flagged with profiler_event_flag_collapsable.
+- Collapsed events are also flagged as with profiler_event_flag_collapsed.
+*/
+#define profiler_collapsable_start( name ) profiler_timeline->collapsable_start_function( profiler_event_id_##name )
+profiler_event_t* profiler_collapsable_start_( profiler_event_id_t name );
+
+
+/*
+End a collapsable event.
+
+Needs a matching profiler_collapsable_start before.
+*/
+#define profiler_collapsable_end( name ) profiler_timeline->collapsable_end_function( profiler_event_id_##name )
+profiler_event_t* profiler_collapsable_end_( profiler_event_id_t name );
+
+
+/*
+Disable the profiler at run time.
+
+This is meant to disable the profiler before it is initialized so that even if
+a program is compiled with the profiler, there is a way to not use it based on
+the runtime state (e.g. a command line argument).
+
+This function needs to be called before any other profiler function.
+
+In practice this function will replace profiler_initialize,
+profiler_timeline_initialize, profiler_finalize and profiler_cleanup with
+functions that don't rely on the memory allocation they normally need, and
+disable event recording.
+*/
+void profiler_disable( void );
+
+
+/*
+Enable event recording for the timeline at the given index.
+
+Flags can be use to only enable events, or collapsable. If flags is 0 both are
+enabled.
+*/
+void profiler_enable_for_timeline_index( uint32_t index, profiler_enable_flag_t flags );
+
+/*
+Disable event recording for the timeline at the given index;
+
+Flags can be use to only disable events, or collapsable. If flags is 0 both are
+disabled.
+*/
+void profiler_disable_for_timeline_index( uint32_t index, profiler_enable_flag_t flags );
+
+/*
+Enable event recording for the timeline associated with the thread calling the
+function.
+
+Flags can be use to only enable events, or collapsable. If flags is 0 both are
+enabled.
+*/
+void profiler_enable_for_current_timeline( profiler_enable_flag_t flags );
+
+/*
+Disable event recording for the timeline associated with the thread calling the
+function.
+
+Flags can be use to only disable events, or collapsable. If flags is 0 both are
+disabled.
+*/
+void profiler_disable_for_current_timeline( profiler_enable_flag_t flags );
+
+/*
+Enable event recording for all timelines.
+
+Flags can be use to only enable events, or collapsable. If flags is 0 both are
+enabled.
+*/
+void profiler_enable_for_all_timelines( profiler_enable_flag_t flags );
+
+/*
+Disable event recording for all timelines.
+
+Flags can be use to only disable events, or collapsable. If flags is 0 both are
+disabled.
+*/
+void profiler_disable_for_all_timelines( profiler_enable_flag_t flags );
+
+/*
+Get the next event stream pointer and size from the current session.
+*/
+void* profiler_events_get_next( uintptr_t* size );
+
+
+/*
+Get the first event stream pointer and size from the current session.
+*/
+void* profiler_events_get_first( uintptr_t* size );
+
+
+/*
+Get the meta data part of the profile to store.
+
+The memory will need to be freed by calling profiler_free_memory.
+
+Errors:
+- profiler_error_get_memory_failed: the memory allocation failed. "size"
+  contains the amount of memory the function tried to allocate. It's safe to
+  clear the error and try again.
+*/
+void* profiler_meta_get_from_session( uintptr_t* size, uint32_t* error );
+
+
+/*
+Initialize the profiler_tool_t meta data part from the current profile session.
+
+Errors:
+- profiler_error_get_memory_failed: the memory allocation failed. No memory was
+  allocated. It's safe to clear the error and try again.
+*/
+void profiler_tool_initialize_meta_from_session( profiler_tool_t* tool, uint32_t* error );
+
+
+/*
+ Create a profiler_tool_t from the current session.
+
+Errors:
+- profiler_error_get_memory_failed: the memory allocation failed, either for the
+  meta data, a timeline or a timeline totals. To try again, you must call
+  profiler_tool_free_memory first and clear the error code.
+*/
+profiler_tool_t profiler_tool_initialize_from_session( void* user_data_init, uintptr_t user_data_size, uint32_t* error );
+
+
+/*
+Pushes a textual representation of the current session profile in "buffer".
+
+Errors:
+- profiler_error_buffer_make_null_pointer: if buffer is 0.
+- profiler_error_get_memory_failed: the creation of a profiler_tool_t failed.
+  See profiler_tool_initialize_from_session for details.
+  profiler_tool_free_memory has already been called.
+- profiler_error_buffer_not_enough_memory: if size isn't enough to store the
+  full printout. The printout is incomplete, but the returned value contains the
+  number of bytes used.
+In case of error it's safe to clear the error and try again.
+*/
+uintptr_t profiler_print_from_session( void* buffer, uintptr_t size, uint32_t* error );
+
+
+/*
+Writes the session profile to a file.
+
+- "file_name" is a zero terminated string.
+- "overwrite" indicates to overwrite the file on disc if it's value is greater or
+  equal to 1. If the value is zero and the file already exists, a
+  profiler_error_file_creation_failed error will be generated.
+
+Errors:
+- profiler_error_file_creation_failed: the file couldn't be created;
+- profiler_error_file_writing_failed: writing in the file failed;
+- profiler_error_file_writing_incomplete: all the data couldn't be written;
+
+If an error is set, a partial profile might have been written to disk, and is
+probably unusable.
+
+The file structure is:
+
+Header:
+- 4 bytes containing the signature "PROF" (ascii character).
+- 4 bytes for the version; Must be 0x00000001 at the moment (uint32_t).
+- 8 bytes for the meta data size (uint64_t);
+- 8 bytes for the offset from the start of the file to the first byte of the
+  meta data (uint64_t);
+- 8 bytes for the timelines size (1 size for all timelines data) (uint64_t);
+- 8 bytes for the offset from the start of the file to the first byte of the
+  timelines data (uint64_t);
+
+Meta data:
+- 4 bytes for the number of different timeline ids (uint32_t);
+- 4 bytes for the number of timeline (uint32_t);
+- 4 bytes for the number of different event ids (uint32_t);
+- 8 bytes for the size of the buffer containing timeline string ids (uint64_t);
+- 8 bytes for the size of the buffer containing event string ids (uint64_t);
+- 2 bytes * the number of timeline id: an array containing the length (uint16_t)
+  of the timeline id strings ;
+- The timeline id string buffer (uint8_t);
+- 8 bytes * the number of timelines: an array containing the size (uint64_t)
+  of each timelines;
+- 4 bytes * the number of timelines: an array containing the timeline id
+  (uint32_t) of each timeline;
+- 2 bytes * the number of event id: an array containing the length (uint16_t) of
+  the event id strings;
+- The event id string buffer (uint8_t);
+
+- 8 bytes for the platform frequency (uint64_t);
+- 8 bytes for the fallback cycles (uint64_t);
+- 8 bytes for the fallback time (uint64_t);
+- 1 byte for the platform type (uint8_t);
+
+- 1 byte for the windows version (uint8_t);
+- 1 byte for the windows qpc shift (uint8_t);
+- 8 bytes for the windows qpc bias (uint64_t);
+- 8 bytes for windows mul128 (uint64_t);
+- 8 bytes for windows add (uint64_t);
+
+- 4 bytes for linux mult (uint32_t);
+- 4 bytes for linux shift (uint32_t);
+
+Timelines data:
+Timeline data must be aligned on a 16 bytes boundary. Each timelines contains an
+even number of events. Each event is 16 bytes:
+- 8 bytes for the event cycles (uint64_t);
+- 4 bytes for the id (uint32_t);
+- 4 bytes for the flags (uint32_t);
+Events are stored one after the other (a timeline event stream). Each timeline
+event stream is written one after the other.
+*/
+uint64_t profiler_write_to_file( void* file_name, uint32_t overwrite, uint32_t* error );
+
+#else
+
+#define profiler_timeline_initialize( name, max_event_count, error )
+#define profiler_initialize( name, main_thread_max_event_count, error )
+#define profiler_finalize( )
+#define profiler_cleanup( )
+#define profiler_timeline_set_id( name )
+#define profiler_timeline_set_id_for_index( name, index )
+#define profiler_enable_for_timeline_index( index, flags )
+#define profiler_disable_for_timeline_index( index, flags )
+#define profiler_enable_for_current_timeline( flags )
+#define profiler_disable_for_current_timeline( flags )
+#define profiler_enable_for_all_timelines( flags )
+#define profiler_disable_for_all_timelines( flags )
+#define profiler_disable( )
+#define profiler_event_start( name ) 0
+#define profiler_event_end( name ) 0
+#define profiler_collapsable_start( name ) 0
+#define profiler_collapsable_end( name ) 0
+#define profiler_events_get_next( size ) ( ( *( size ) = 0 ), ( void* ) 0 )
+#define profiler_events_get_first( size ) ( ( *( size ) = 0 ), ( void* ) 0 )
+#define profiler_meta_get_from_session( size, error ) ( ( *( size ) = 0 ), ( void* ) 0 )
+#define profiler_tool_initialize_meta_from_session( tool_ptr, error ) ( *( error ) = 0 )
+#define profiler_tool_initialize_from_session( user_data_init, user_data_size, error ) { 0 }; ( *( error ) = 0 )
+#define profiler_print_from_session( buffer, buffer_size, error ) 0
+#define profiler_write_to_file( file_name, overwrite, error ) 0; ( *( error ) = 0 )
+
+#endif
+
+/* NOTE simon: It may work on x86 but wasn't tested on windows, and wasn't tested in a long while on linux. */
+
+#if defined( _WIN64 ) && defined( _M_X64 )
+#define PROFILER_WINDOWS
+#elif defined( __unix__ ) && ( defined( __x86_64__ ) || defined( __i386__ ) )
+#define PROFILER_LINUX
+#else
+#error Unsupported platform.
+#endif
+
+#if defined( _MSC_VER )
+#define PROFILER_MSVC
+#elif defined( __clang__ )
+#define PROFILER_CLANG
+#elif defined( __GNUC__ )
+#define PROFILER_GCC
+#else
+#error Unsupported compiler.
+#endif
+
+#if defined( __cplusplus )
+#define profiler_extern_c extern "C"
+#else
+#define profiler_extern_c
+#endif
+
+#if defined( PROFILER_MSVC )
+#define profiler_thread_local_storage __declspec( thread )
+#elif defined( PROFILER_CLANG ) || defined( PROFILER_GCC )
+#define profiler_thread_local_storage __thread
+#elif __cplusplus >= 201103L
+#define profiler_thread_local_storage thread_local
+#elif __STDC_VERSION_ >= 201112L
+#define profiler_thread_local_storage _Thread_local
+#else
+# error Unsupported platform.
+#endif
+
+#if defined( PROFILER_DEBUG ) && !defined( PROFILER_ASSERT )
+#define PROFILER_ASSERT
+#endif
+
+#if defined( PROFILER_MSVC )
+#define PROFILER_DEBUG_BREAK __debugbreak( )
+#elif defined( PROFILER_CLANG )
+#define PROFILER_DEBUG_BREAK __builtin_debugtrap( )
+#elif defined( PROFILER_GCC )
+/* NOTE simon: GCC doesn’t seem to have __builtin_debugtrap, although in my tests it seems to work. */
+#define PROFILER_DEBUG_BREAK __asm__( "int $3" )
+#else
+# error Unsupported compiler.
+#endif
+
+#define profiler_safe_macro( macro ) do { macro; } while ( 0 )
+
+#if defined( PROFILER_ASSERT )
+#define profiler_assert( expression ) profiler_safe_macro( if ( !( expression ) ) { PROFILER_DEBUG_BREAK; } )
+#else
+#define profiler_assert( expression )
+#endif
+
+#define profiler_ctassert3( expression, count ) struct Foo##count { int foo[ ( expression ) ? 1 : -1 ]; }
+#define profiler_ctassert2( expression, count ) profiler_ctassert3( expression, count )
+#define profiler_ctassert( expression ) profiler_ctassert2( expression, __COUNTER__ )
+
+#define profiler_no_error( error_pointer ) ( *( error_pointer ) == 0 )
+#define profiler_is_error( error_pointer ) ( *( error_pointer ) != 0 )
+#define profiler_set_error( error_pointer, error_value ) ( ( *( error_pointer ) ) = error_value )
+#define profiler_clear_error( error_pointer ) ( *( error_pointer ) = 0 )
+
+#if defined( PROFILER_IMPLEMENTATION )
+
+#include <xmmintrin.h>
+
+#if defined( PROFILER_WINDOWS )
+
+#include <intrin.h>
+/* NOTE simon: to read processor register performance counter https://www.felixcloutier.com/x86/rdpmc
+__readpmc for msvc, but needs to be in kernel mode or change 9th bit of CR4 register (which itself might need kernel mode ?) (I suppose paramenter is the content of ecx).
+kernel mode driver: https://docs.microsoft.com/en-us/windows-hardware/drivers/gettingstarted/ */
+
+#if !defined( profiler_get_memory )
+
+#if defined( profiler_free_memory )
+# error "If you define profiler_free_memory, you need to define profiler_get_memory."
+#endif
+
+/* From winnt.h */
+#define profiler_PAGE_READWRITE         0x04
+#define profiler_MEM_COMMIT                  0x1000
+#define profiler_MEM_RESERVE                 0x2000
+#define profiler_MEM_RELEASE                 0x8000
+
+/* From memoryapi.h */
+profiler_extern_c __declspec( dllimport ) void* VirtualAlloc( void* lpAddress, uintptr_t dwSize, unsigned long flAllocationType, unsigned long flProtect );
+profiler_extern_c __declspec( dllimport ) int VirtualFree( void* lpAddress, uintptr_t dwSize, unsigned long dwFreeType );
+
+#define profiler_get_memory( size ) VirtualAlloc( 0, size, profiler_MEM_RESERVE | profiler_MEM_COMMIT, profiler_PAGE_READWRITE )
+#define profiler_free_memory( address, size ) VirtualFree( address, 0, profiler_MEM_RELEASE )
+
+#else /* profiler_get_memory */
+
+#if !defined( profiler_free_memory )
+# error "If you define profiler_get_memory, you need to define profiler_free_memory."
+#endif
+
+#endif /* profiler_get_memory */
+
+#elif defined( PROFILER_LINUX )
+
+#include <x86intrin.h>
+
+#if !defined( profiler_get_memory )
+
+#if defined( profiler_free_memory )
+# error "If you define profiler_free_memory, you need to define profiler_get_memory."
+#endif
+
+#include <sys/mman.h>
+
+#define profiler_get_memory( size ) mmap( 0, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0 )
+#define profiler_free_memory( address, size ) munmap( address, size )
+
+#else /* profiler_get_memory */
+
+#if !defined( profiler_free_memory )
+# error "If you define profiler_get_memory, you need to define profiler_free_memory."
+#endif
+
+#endif  /* profiler_get_memory */
+
+#else
+# error Unsupported platform.
+#endif
+
+profiler_buffer_t profiler_buffer_make( uintptr_t reserved, uintptr_t used, void* bytes, uint32_t* error ) {
+    
+    profiler_buffer_t result = { 0 };
+    
+    if ( profiler_no_error( error ) ) {
+        
+        if ( bytes ) {
+            result.bytes = ( uint8_t* ) bytes;
+            result.reserved = reserved;
+            result.used = used;
+        } else {
+            profiler_set_error( error, profiler_error_buffer_make_null_pointer );
+        }
+    }
+    
+    return result;
+}
+
+#define profiler_buffer_push_array( buffer, type, count, error ) ( type* ) profiler_buffer_push_size( ( buffer ), sizeof( type ) * ( count ), ( error ) )
+#define profiler_buffer_push_struct( buffer, type, error ) ( type* ) profiler_buffer_push_size( ( buffer ), sizeof( type ), ( error ) )
+
+static void* profiler_buffer_push_size( profiler_buffer_t* buffer, uintptr_t size, uint32_t* error ) {
+    
+    void* result = 0;
+    
+    if ( profiler_no_error( error ) ) {
+        
+        if ( buffer->used + size <= buffer->reserved ) {
+            result = buffer->bytes + buffer->used;
+            buffer->used += size;
+        } else {
+            profiler_set_error( error, profiler_error_buffer_not_enough_memory );
+        }
+    }
+    
+    return result;
+}
+
+#define profiler_buffer_push_string_l( buffer, string, error ) profiler_buffer_push_string_p( ( buffer ), ( void* ) ( string ), sizeof( string ) - 1, ( error ) )
+
+static void profiler_buffer_push_string_p( profiler_buffer_t* buffer, void* string, uintptr_t string_length, uint32_t* error ) {
+    
+    uint8_t* d = ( uint8_t* ) profiler_buffer_push_size( buffer, string_length, error );
+    
+    if ( profiler_no_error( error ) ) {
+        
+        uint8_t* s = ( uint8_t* ) string;
+        uint8_t* s_end = s + string_length;
+        
+        while ( s < s_end ) {
+            *d = *s;
+            d++;
+            s++;
+        }
+    }
+}
+
+static void profiler_buffer_write_u8( profiler_buffer_t* buffer, uint8_t value, uint32_t* error ) {
+    uint8_t* address = ( uint8_t* ) profiler_buffer_push_size( buffer, sizeof( uint8_t ), error );
+    if ( profiler_no_error( error ) ) {
+        ( *address ) = value;
+    }
+}
+
+static void profiler_buffer_write_u16( profiler_buffer_t* buffer, uint16_t value, uint32_t* error ) {
+    uint16_t* address = ( uint16_t* ) profiler_buffer_push_size( buffer, sizeof( uint16_t ), error );
+    if ( profiler_no_error( error ) ) {
+        ( *address ) = value;
+    }
+}
+
+static void profiler_buffer_write_u32( profiler_buffer_t* buffer, uint32_t value, uint32_t* error ) {
+    uint32_t* address = ( uint32_t* ) profiler_buffer_push_size( buffer, sizeof( uint32_t ), error );
+    if ( profiler_no_error( error ) ) {
+        ( *address ) = value;
+    }
+}
+
+static void profiler_buffer_write_u64( profiler_buffer_t* buffer, uint64_t value, uint32_t* error ) {
+    uint64_t* address = ( uint64_t* ) profiler_buffer_push_size( buffer, sizeof( uint64_t ), error );
+    if ( profiler_no_error( error ) ) {
+        ( *address ) = value;
+    }
+}
+
+static void profiler_buffer_read_u8( profiler_buffer_t* buffer, uint8_t* destination, uint32_t* error ) {
+    uint8_t* source = ( uint8_t* ) profiler_buffer_push_size( buffer, sizeof( uint8_t ), error );
+    if ( profiler_no_error( error ) ) {
+        *destination = *source;
+    }
+}
+
+static void profiler_buffer_read_u16( profiler_buffer_t* buffer, uint16_t* destination, uint32_t* error ) {
+    uint16_t* source = ( uint16_t* ) profiler_buffer_push_size( buffer, sizeof( uint16_t ), error );
+    if ( profiler_no_error( error ) ) {
+        *destination = *source;
+    }
+}
+
+static void profiler_buffer_read_u32( profiler_buffer_t* buffer, uint32_t* destination, uint32_t* error ) {
+    uint32_t* source = ( uint32_t* ) profiler_buffer_push_size( buffer, sizeof( uint32_t ), error );
+    if ( profiler_no_error( error ) ) {
+        *destination = *source;
+    }
+}
+
+static void profiler_buffer_read_u64( profiler_buffer_t* buffer, uint64_t* destination, uint32_t* error ) {
+    uint64_t* source = ( uint64_t* ) profiler_buffer_push_size( buffer, sizeof( uint64_t ), error );
+    if ( profiler_no_error( error ) ) {
+        *destination = *source;
+    }
+}
+
+#define profiler_array_count( array ) ( ( uintptr_t ) ( sizeof( array ) / sizeof( ( array )[ 0 ] ) ) )
+
+static void profiler_memory_copy( void* destination, void* source, uintptr_t size ) {
+    
+#if defined( PROFILER_MSVC )
+    __movsb( ( unsigned char* ) destination, ( unsigned char* ) source, size );
+#elif defined( PROFILER_CLANG ) || defined( PROFILER_GCC )
+    __asm__ __volatile__( "rep movsb" : "+D" ( destination ), "+S" ( source ), "+c" ( size ) : : "memory" );
+#else
+# error Unsupprted platform.
+#endif
+}
+
+static void profiler_memory_copy_2( void* destination, void* source, uintptr_t size ) {
+    
+    profiler_assert( ( size % 2 ) == 0 );
+    
+#if defined( PROFILER_MSVC )
+    __movsw( ( unsigned short* ) destination, ( unsigned short* ) source, size / 2 );
+#elif defined( PROFILER_CLANG ) || defined( PROFILER_GCC )
+    size /= 2;
+    __asm__ __volatile__( "rep movsw" : "+D" ( destination ), "+S" ( source ), "+c" ( size ) : : "memory" );
+#else
+# error Unsupprted platform.
+#endif
+}
+
+static void profiler_memory_copy_4( void* destination, void* source, uintptr_t size ) {
+    
+    profiler_assert( ( size % 4 ) == 0 );
+    
+#if defined( PROFILER_MSVC )
+    __movsd( ( unsigned long* ) destination, ( unsigned long* ) source, size / 4 );
+#elif defined( PROFILER_CLANG ) || defined( PROFILER_GCC )
+    size /= 4;
+    __asm__ __volatile__( "rep movsd" : "+D" ( destination ), "+S" ( source ), "+c" ( size ) : : "memory" );
+#else
+# error Unsupprted platform.
+#endif
+}
+
+static void profiler_memory_copy_8( void* destination, void* source, uintptr_t size ) {
+    
+    profiler_assert( ( size % 8 ) == 0 );
+    
+#if defined( PROFILER_MSVC )
+    __movsq( ( unsigned __int64* ) destination, ( unsigned __int64* ) source, size / 8 );
+#elif defined( PROFILER_CLANG ) || defined( PROFILER_GCC )
+    size /= 8;
+    __asm__ __volatile__( "rep movsq" : "+D" ( destination ), "+S" ( source ), "+c" ( size ) : : "memory" );
+    /*
+    #elif defined( __i386__ )
+        size /= 4;
+        __asm__ __volatile__( "rep movsd" : "+D" ( destination ), "+S" ( source ), "+c" ( size ) : : "memory" );
+    */
+#else
+# error Unsupprted platform.
+#endif
+}
+
+static void profiler_memory_copy_aligned_16( void* destination, void* source, uintptr_t size ) {
+    
+    profiler_assert( ( ( uintptr_t ) destination % 16 ) == 0 );
+    profiler_assert( ( ( uintptr_t ) source % 16 ) == 0 );
+    profiler_assert( ( size % 16 ) == 0 );
+    
+    while ( size ) {
+        __m128i a = _mm_load_si128( ( __m128i* ) source );
+        _mm_stream_si128( ( __m128i* ) destination, a );
+        
+        size -= sizeof( __m128i );
+        source = ( uint8_t* ) source + sizeof( __m128i );
+        destination = ( uint8_t* ) destination + sizeof( __m128i );
+    }
+}
+
+#define profiler_buffer_write( buffer, value, error ) profiler_buffer_write_size( ( buffer ), sizeof( value ), &( value ), ( error ) )
+#define profiler_buffer_write_array( buffer, type, count, source, error ) profiler_buffer_write_size( ( buffer ), sizeof( type ) * ( count ), ( source ), ( error ) )
+#define profiler_buffer_read( buffer, destination, error ) profiler_buffer_read_size( ( buffer ), sizeof( destination ), &( destination ), ( error ) )
+#define profiler_buffer_read_array( buffer, type, count, destination, error ) profiler_buffer_read_size( ( buffer ), sizeof( type ) * ( count ), ( destination ), ( error ) )
+
+static void profiler_buffer_write_size( profiler_buffer_t* buffer, uintptr_t size, void* source, uint32_t* error ) {
+    void* destination = profiler_buffer_push_size( buffer, size, error );
+    if ( profiler_no_error( error ) ) {
+        profiler_memory_copy( destination, source, size );
+    }
+}
+
+static void profiler_buffer_read_size( profiler_buffer_t* buffer, uintptr_t size, void* destination, uint32_t* error ) {
+    void* source = profiler_buffer_push_size( buffer, size, error );
+    if ( profiler_no_error( error ) ) {
+        profiler_memory_copy( destination, source, size );
+    }
+}
+
+uint32_t profiler_get_event_id_from_name_p( profiler_tool_t* tool, void* string, uintptr_t length ) {
+    
+    uint32_t result = 0xffffffff;
+    
+    uint8_t* bytes = ( uint8_t* ) string;
+    uint8_t* end = bytes + length;
+    
+    if ( bytes ) {
+        
+        for ( uintptr_t i = 0; i < tool->event_id_count; i++ ) {
+            
+            uint8_t* event_id_string = tool->event_id_strings[ i ];
+            uintptr_t event_id_string_length = tool->event_id_string_lengths[ i ];
+            
+            if ( event_id_string_length == length ) {
+                
+                uint8_t* current = bytes;
+                
+                while ( current < end && *current == *event_id_string ) {
+                    current++;
+                    event_id_string++;
+                }
+                
+                if ( current == end ) {
+                    result = ( uint32_t ) i;
+                    break;
+                }
+            }
+        }
+    }
+    
+    return result;
+}
+
+uint64_t profiler_cycles_to_time_fallback( profiler_tool_t* tool, uint64_t cycles ) {
+    uint64_t time = ( uint64_t ) ( ( double ) cycles * ( ( double ) tool->fallback_time / ( double ) tool->fallback_cycles ) );
+    return time;
+}
+
+/* NOTE simon: You must pass the "raw cycles", not a difference/addition... between two event cycles.
+If c0 and c1 are cycles, bias is the qpc bias and 1024 is the equivalent of a qpc shift of 10 bits
+( ( c1 + bias ) / 1024 ) - ( ( c0 + bias ) / 1024 ) doesn't equal ( ( c1 - c0 ) + bias ) / 1024
+( ( c1 + bias ) - ( c0 + bias ) ) / 1024 doesn't equal ( ( c1 - c0 ) + bias ) / 1024
+ ( c1 + bias - c0 - bias ) / 1024 doesn't equal ( ( c1 - c0 ) + bias ) / 1024
+( c1 - c0 ) / 1024 doesn't equal ( ( c1 - c0 ) + bias ) / 1024
+*/
+uint64_t profiler_cycles_to_time( profiler_tool_t* tool, uint64_t cycles ) {
+    
+    uint64_t time = cycles;
+    profiler_platform_data_t* platform = &tool->platform_data;
+    
+    if ( tool->platform == profiler_platform_windows ) {
+        
+        if ( platform->windows.version == profiler_windows_version_10 ) {
+            
+#if defined( PROFILER_MSVC )
+            
+            time = __umulh( cycles, platform->windows.mul128 );
+            
+#elif defined( PROFILER_CLANG ) || defined( PROFILER_GCC )
+            
+            unsigned __int128 big = ( unsigned __int128 ) cycles * platform->windows.mul128;
+            time = ( uint64_t ) ( big >> 64 );
+            
+#else
+# error Unsupported compiler.
+#endif
+            time += platform->windows.add;
+        }
+        
+        time += platform->windows.qpc_bias;
+        time >>= platform->windows.qpc_shift;
+        
+    } else if ( tool->platform == profiler_platform_linux ) {
+        
+#if defined( PROFILER_MSVC )
+        
+        uint64_t high = 0;
+        uint64_t low = _umul128( cycles, platform->linux_.mult, &high );
+        profiler_assert( platform->linux_.shift <= 0xff );
+        time = __shiftright128( low, high, ( unsigned char ) platform->linux_.shift );
+        
+#elif defined( PROFILER_CLANG ) || defined( PROFILER_GCC )
+        
+        unsigned __int128 big = ( unsigned __int128 ) time * tool->platform_data.linux_.mult;
+        big >>= tool->platform_data.linux_.shift;
+        time = ( uint64_t ) big;
+        
+#else
+# error Unsupported compiler.
+#endif
+        
+    } else {
+        
+        profiler_assert( tool->platform == profiler_platform_fallback );
+        time = profiler_cycles_to_time_fallback( tool, cycles );
+    }
+    
+    return time;
+}
+
+uint32_t profiler_node_is_root( profiler_node_t* node ) {
+    uint32_t result = node && ( node->parent == 0 );
+    return result;
+}
+
+profiler_node_t* profiler_timeline_get_root_from_node( profiler_node_t* node ) {
+    
+    if ( node ) {
+        while ( node->parent ) {
+            node = node->parent;
+        }
+    }
+    
+    return node;
+}
+
+static uintptr_t profiler_buffer_push_u64( profiler_buffer_t* output_buffer, uint64_t integer, uintptr_t desired_digit_count, uint8_t fill_with, uint32_t hexadecimal_format, uint32_t* error ) {
+    
+    uintptr_t start_used = output_buffer->used;
+    
+    if ( profiler_no_error( error ) ) {
+        
+        uint8_t base = 10;
+        
+        if ( hexadecimal_format & profiler_hf_on ) {
+            
+            base = 16;
+            
+            if ( !( hexadecimal_format & profiler_hf_no_prefix ) ) {
+                profiler_buffer_push_string_l( output_buffer, "0x", error );
+            }
+        }
+        
+        uint64_t number = integer;
+        uint32_t digits = 1;
+        
+        while ( number > ( uint8_t ) ( base - 1 ) ) {
+            number /= base;
+            digits++;
+        }
+        
+        uintptr_t filling = 0;
+        
+        if ( desired_digit_count ) {
+            filling = desired_digit_count - digits;
+        }
+        
+        for ( uintptr_t i = 0; profiler_no_error( error ) && i < filling; i++ ) {
+            profiler_buffer_write_u8( output_buffer, fill_with, error );
+        }
+        
+        while ( profiler_no_error( error ) && digits > 0 ) {
+            
+            uint64_t divider = 1;
+            
+            for ( uint32_t i = 0; i < ( digits - 1 ); i++ ) {
+                divider *= base;
+            }
+            
+            uint64_t digit = integer / divider;
+            
+            if ( digit < 10 ) {
+                profiler_buffer_write_u8( output_buffer, ( uint8_t ) ( '0' + digit ), error );
+            } else {
+                profiler_buffer_write_u8( output_buffer, ( uint8_t ) ( 'a' + ( digit - 10 ) ), error );
+            }
+            
+            integer -= divider * digit;
+            digits--;
+        }
+    }
+    
+    uintptr_t result = output_buffer->used - start_used;
+    
+    return result;
+}
+
+static uintptr_t profiler_buffer_push_r64( profiler_buffer_t* buffer, double real, uintptr_t integer_character_count, uint8_t fill_with, uintptr_t decimal_count, uint32_t* error ) {
+    
+    /* TODO simon: This function seems enough for our purpose, but I should try to use a better algorithm. */
+    uintptr_t result = buffer->used;
+    
+    if ( profiler_no_error( error ) ) {
+        
+#if 1
+        if ( real >= 0 ) {
+            
+            uint64_t integer_part = ( uint64_t ) real;
+            profiler_buffer_push_u64( buffer, integer_part, integer_character_count, fill_with, 0, error );
+            
+        } else {
+            
+            real *= -1.0f;
+            uint64_t integer_part = ( uint64_t ) real;
+            uintptr_t integer_part_length = 0;
+            uint64_t temp = integer_part;
+            
+            while ( temp > 0 ) {
+                integer_part_length++;
+                temp /= 10;
+            }
+            
+            uintptr_t fill_length = integer_character_count - integer_part_length - 1;
+            
+            for ( uintptr_t i = 0; i < fill_length; i++ ) {
+                profiler_buffer_write_u8( buffer, fill_with, error );
+            }
+            
+            profiler_buffer_write_u8( buffer, '-', error );
+            profiler_buffer_push_u64( buffer, integer_part, 0, 0, 0, error );
+        }
+        
+        if ( decimal_count ) {
+            profiler_buffer_write_u8( buffer, '.', error );
+        }
+        
+        double decimal = real - ( uint64_t ) real;
+        
+        while ( decimal_count > 0 ) {
+            
+            decimal *= 10;
+            
+            if ( decimal < 1.0f ) {
+                profiler_buffer_write_u8( buffer, '0', error );
+            }
+            
+            decimal_count--;
+        }
+        
+        uint64_t decimal_part = ( uint64_t ) decimal;
+        
+        if ( decimal_part > 0 ) {
+            profiler_buffer_push_u64( buffer, decimal_part, 0, 0, 0, error );
+        }
+        
+#else
+        int width = 9 + 1 + integer_character_count;
+        buffer->used += snprintf( ( char* ) buffer->bytes + buffer->used, buffer->reserved - buffer->used, "%*.9f", width, real );
+#endif
+    }
+    
+    result = buffer->used - result;
+    
+    return result;
+}
+
+static uint8_t profiler_get_padding( void* address, uint64_t alignment ) {
+    
+    uintptr_t a = ( uintptr_t ) address;
+    uint8_t padding = ( uint8_t ) ( ( ~( a - 1 ) ) & ( alignment - 1 ) );
+    return padding;
+}
+
+void profiler_print_node( profiler_tool_t* tool, profiler_buffer_t* buffer, profiler_node_t* node, uintptr_t indent_level, uint32_t* error ) {
+    
+    if ( profiler_no_error( error ) ) {
+        
+        if ( node->parent ) {
+            
+            uintptr_t indent_size = indent_level * tool->indent_space_count;
+            
+            if ( indent_size > tool->print_event_id_width ) {
+                indent_size = tool->print_event_id_width;
+            }
+            
+            uintptr_t id_length = tool->event_id_string_lengths[ node->id ];
+            uintptr_t line_length = indent_size + id_length;
+            
+            if ( line_length > tool->print_event_id_width ) {
+                id_length = tool->print_event_id_width - indent_size;
+            }
+            
+            uintptr_t padding_size = ( line_length < tool->print_event_id_width ) ? ( tool->print_event_id_width - line_length ) : 0;
+            
+            uint8_t* spaces = ( uint8_t* ) profiler_buffer_push_size( buffer, indent_size, error );
+            
+            if ( profiler_no_error( error ) ) {
+                for( uintptr_t i = 0; i < indent_size; i++ ) {
+                    *spaces = ' ';
+                    spaces++;
+                }
+            }
+            
+            profiler_buffer_push_string_p( buffer, tool->event_id_strings[ node->id ], tool->event_id_string_lengths[ node->id ], error );
+            
+            uint8_t* dots = ( uint8_t* ) profiler_buffer_push_size( buffer, padding_size, error );
+            
+            if ( profiler_no_error( error ) ) {
+                for ( uintptr_t i = 0; i < padding_size; i++ ) {
+                    *dots = '.';
+                    dots++;
+                }
+            }
+            
+            uint64_t duration_cycles = node->end_cycles - node->start_cycles;
+            profiler_buffer_push_u64( buffer, duration_cycles, tool->print_cycles_size, '.', 0, error );
+            profiler_buffer_push_string_l( buffer, "c ", error );
+            uint64_t time = node->end_time - node->start_time;
+            profiler_buffer_push_r64( buffer, ( double ) time / ( double ) tool->frequency, tool->print_time_integer_size, ' ', 9, error );
+            profiler_buffer_push_string_l( buffer, "s\n", error );
+            
+            indent_level++;
+        }
+        
+        profiler_node_t* child = node->first_child;
+        
+        for ( uintptr_t i = 0; profiler_no_error( error ) && i < node->child_count; i++ ) {
+            profiler_assert( child );
+            profiler_print_node( tool, buffer, child, indent_level, error );
+            child = child->next_sibling;
+        }
+    }
+}
+
+void profiler_totals_initialize( profiler_tool_t* tool, profiler_totals_t* totals, uint32_t* error ) {
+    
+    profiler_assert( totals->memory.reserved == 0 );
+    profiler_assert( totals->memory.used == 0 );
+    profiler_assert( totals->memory.bytes == 0 );
+    
+    totals->memory.reserved =
+    ( sizeof( profiler_node_t* ) /* totals->in_parent */
+     + sizeof( uint64_t ) + sizeof( uint64_t ) /* totals->cycles + totals->not_measured_cycles */
+     + sizeof( uint64_t ) + sizeof( uint64_t ) /* totals->time + totals->not_measured_time */
+     + sizeof( uint64_t ) /* totals->hits */
+     + sizeof( uint32_t ) ) /* totals->id */
+        * tool->event_id_count;
+    totals->memory.bytes = ( uint8_t* ) profiler_get_memory( totals->memory.reserved );
+    
+    if ( !totals->memory.bytes ) {
+        
+        profiler_set_error( error, profiler_error_get_memory_failed );
+        
+    } else {
+        
+        totals->maximum_element_count = ( uint32_t ) tool->event_id_count;
+        totals->element_count = totals->maximum_element_count;
+        totals->in_parent = ( profiler_node_t** ) profiler_buffer_push_array( &totals->memory, profiler_node_t*, totals->maximum_element_count, error );
+        totals->cycles = ( uint64_t*  ) profiler_buffer_push_array( &totals->memory, uint64_t, totals->maximum_element_count, error );
+        totals->not_measured_cycles = ( uint64_t*  ) profiler_buffer_push_array( &totals->memory, uint64_t, totals->maximum_element_count, error );
+        totals->time = ( uint64_t*  ) profiler_buffer_push_array( &totals->memory, uint64_t, totals->maximum_element_count, error );
+        totals->not_measured_time = ( uint64_t*  ) profiler_buffer_push_array( &totals->memory, uint64_t, totals->maximum_element_count, error );
+        totals->hits = ( uint64_t*  ) profiler_buffer_push_array( &totals->memory, uint64_t, totals->maximum_element_count, error );
+        totals->id = ( uint32_t*  ) profiler_buffer_push_array( &totals->memory, uint32_t, totals->maximum_element_count, error );
+        
+        profiler_assert( totals->memory.used == totals->memory.reserved );
+        
+        for ( uintptr_t i = 0; i < totals->maximum_element_count; i++ ) {
+            
+            totals->in_parent[ i ] = 0;
+            totals->cycles[ i ] = 0;
+            totals->not_measured_cycles[ i ] = 0;
+            totals->time[ i ] = 0;
+            totals->not_measured_time[ i ] = 0;
+            totals->hits[ i ] = 0;
+            totals->id[ i ] = ( uint32_t ) i;
+        }
+    }
+}
+
+void profiler_totals_reset( profiler_totals_t* totals ) {
+    
+    profiler_assert( totals->memory.reserved != 0 );
+    profiler_assert( totals->memory.used == totals->memory.reserved );
+    
+    totals->element_count = totals->maximum_element_count;
+    
+    for ( uintptr_t i = 0; i < totals->maximum_element_count; i++ ) {
+        
+        totals->in_parent[ i ] = 0;
+        totals->cycles[ i ] = 0;
+        totals->not_measured_cycles[ i ] = 0;
+        totals->time[ i ] = 0;
+        totals->not_measured_time[ i ] = 0;
+        totals->hits[ i ] = 0;
+        totals->id[ i ] = ( uint32_t ) i;
+    }
+}
+
+void profiler_totals_free( profiler_totals_t* totals ) {
+    
+    if ( totals->memory.bytes && totals->memory.reserved ) {
+        profiler_free_memory( totals->memory.bytes, totals->memory.reserved );
+    }
+    
+    totals->memory.bytes = 0;
+    totals->memory.reserved = totals->memory.used = 0;
+    totals->maximum_element_count = 0;
+    totals->element_count = 0;
+    
+    totals->in_parent = 0;
+    totals->cycles = 0;
+    totals->not_measured_cycles = 0;
+    totals->time = 0;
+    totals->not_measured_time = 0;
+    totals->hits = 0;
+    totals->id = 0;
+}
+
+static void profiler_internal_totals_build( profiler_totals_t* totals, profiler_node_t* node, uint32_t flags ) {
+    
+    if ( !totals->in_parent[ node->id ] ) {
+        
+        uint64_t cycles = node->end_cycles - node->start_cycles;
+        totals->cycles[ node->id ] += cycles;
+        totals->not_measured_cycles[ node->id ] += ( cycles - node->childs_cycles );
+        
+        uint64_t time = node->end_time - node->start_time;
+        totals->time[ node->id ] += time;
+        totals->not_measured_time[ node->id ] += ( time - node->childs_time );
+        
+        totals->in_parent[ node->id ] = node;
+    }
+    
+    totals->hits[ node->id ]++;
+    
+    if ( flags & profiler_totals_recursive ) {
+        
+        profiler_node_t* child = node->first_child;
+        
+        for ( uintptr_t i = 0; i < node->child_count; i++ ) {
+            profiler_internal_totals_build( totals, child, flags );
+            child = child->next_sibling;
+        }
+    }
+    
+    if ( totals->in_parent[ node->id ] == node ) {
+        totals->in_parent[ node->id ] = 0;
+    }
+}
+
+void profiler_totals_build( profiler_totals_t* totals, profiler_node_t* node, uint32_t flags ) {
+    
+    totals->element_count = totals->maximum_element_count;
+    
+    for ( uintptr_t i = 0; i < totals->maximum_element_count; i++ ) {
+        totals->id[ i ] = ( uint32_t ) i;
+    }
+    
+    totals->cycles[ 1 ] = ( node->end_cycles - node->start_cycles ) - node->childs_cycles;
+    totals->time[ 1 ] = ( node->end_time - node->start_time ) - node->childs_time;
+    totals->not_measured_cycles[ 1 ] = totals->cycles[ 1 ];
+    totals->not_measured_time[ 1 ] = totals->time[ 1 ];
+    
+    profiler_node_t* child = node->first_child;
+    
+    for ( uintptr_t i = 0; i < node->child_count; i++ ) {
+        profiler_internal_totals_build( totals, child, flags );
+        child = child->next_sibling;
+    }
+    
+    for ( uintptr_t i = 0; i < totals->maximum_element_count; i++ ) {
+        profiler_assert( totals->in_parent[ i ] == 0 );
+    }
+}
+
+uint32_t profiler_totals_get_element_count( profiler_totals_t* totals ) {
+    
+    uint32_t result = 0;
+    
+    for ( uintptr_t i = 0; i < totals->maximum_element_count; i++ ) {
+        
+        if ( totals->cycles[ i ] ) {
+            result++;
+        }
+    }
+    
+    return result;
+}
+
+typedef struct profiler_child_totals_t {
+    uint64_t cycles;
+    uint64_t time;
+} profiler_child_totals_t;
+
+#define profiler_math_clamp( min, value, max ) ( ( ( value ) < ( min ) ) ? ( min ) : ( ( value ) > ( max ) ) ? ( max ) : ( value ) )
+
+static profiler_child_totals_t profiler_internal_totals_build_in_range( profiler_totals_t* totals, profiler_node_t* node, uint32_t flags, profiler_event_range_t range ) {
+    
+    uint64_t node_start_cycles = profiler_math_clamp( range.start_cycles, node->start_cycles, range.end_cycles );
+    uint64_t node_end_cycles = profiler_math_clamp( range.start_cycles, node->end_cycles, range.end_cycles );
+    uint64_t cycles = node_end_cycles - node_start_cycles;
+    
+    uint64_t node_start_time = profiler_math_clamp( range.start_time, node->start_time, range.end_time );
+    uint64_t node_end_time = profiler_math_clamp( range.start_time, node->end_time, range.end_time );
+    uint64_t time = node_end_time - node_start_time;
+    
+    if ( !totals->in_parent[ node->id ] ) {
+        
+        totals->cycles[ node->id ] += cycles;
+        totals->not_measured_cycles[ node->id ] += cycles;
+        
+        totals->time[ node->id ] += time;
+        totals->not_measured_time[ node->id ] += time;
+        
+        totals->in_parent[ node->id ] = node;
+    }
+    
+    totals->hits[ node->id ]++;
+    
+    if ( flags & profiler_totals_recursive ) {
+        
+        profiler_node_t* child = node->first_child;
+        
+        for ( uintptr_t i = 0; i < node->child_count; i++ ) {
+            
+            profiler_child_totals_t child_totals = profiler_internal_totals_build_in_range( totals, child, flags, range );
+            
+            if ( node->id != child->id ) {
+                totals->not_measured_cycles[ node->id ] -= child_totals.cycles;
+                totals->not_measured_time[ node->id ] -= child_totals.time;
+            }
+            
+            child = child->next_sibling;
+        }
+    }
+    
+    if ( totals->in_parent[ node->id ] == node ) {
+        totals->in_parent[ node->id ] = 0;
+    }
+    
+    profiler_child_totals_t node_totals = { cycles, time };
+    
+    return node_totals;
+}
+
+#undef profiler_math_clamp
+
+#define profiler_swap_type( a, b, type ) { type temp = ( a ); ( a ) = ( b ); ( b ) = temp; }
+
+void profiler_totals_compact( profiler_totals_t* totals ) {
+    
+    uintptr_t free_index = 0;
+    uintptr_t data_index = ( totals->maximum_element_count ) ? totals->maximum_element_count - 1 : 0;
+    
+    totals->element_count = 0;
+    
+    while ( free_index < data_index ) {
+        
+        while( totals->cycles[ free_index ] ) {
+            totals->element_count++;
+            free_index++;
+        }
+        
+        while ( data_index && totals->cycles[ data_index ] == 0 ) {
+            data_index--;
+        }
+        
+        if ( free_index < data_index ) {
+            profiler_swap_type( totals->cycles[ free_index ], totals->cycles[ data_index ], uint64_t );
+            profiler_swap_type( totals->not_measured_cycles[ free_index ], totals->not_measured_cycles[ data_index ], uint64_t );
+            profiler_swap_type( totals->time[ free_index ], totals->time[ data_index ], uint64_t );
+            profiler_swap_type( totals->not_measured_time[ free_index ], totals->not_measured_time[ data_index ], uint64_t );
+            profiler_swap_type( totals->hits[ free_index ], totals->hits[ data_index ], uint64_t );
+            profiler_swap_type( totals->id[ free_index ], totals->id[ data_index ], uint32_t );
+            totals->element_count++;
+            free_index++;
+            data_index--;
+        }
+    }
+}
+
+void profiler_totals_build_in_range( profiler_totals_t* totals, profiler_node_t* node, uint32_t flags, profiler_event_range_t range ) {
+    
+    totals->element_count = totals->maximum_element_count;
+    
+    for ( uintptr_t i = 0; i < totals->maximum_element_count; i++ ) {
+        totals->id[ i ] = ( uint32_t ) i;
+    }
+    
+    profiler_node_t* child = node->first_child;
+    
+    for ( uintptr_t i = 0; i < node->child_count; i++ ) {
+        
+        if ( child->start_cycles < range.end_cycles && child->end_cycles > range.start_cycles ) {
+            profiler_internal_totals_build_in_range( totals, child, flags, range );
+        }
+        
+        child = child->next_sibling;
+    }
+    
+    for ( uintptr_t i = 0; i < totals->maximum_element_count; i++ ) {
+        profiler_assert( totals->in_parent[ i ] == 0 );
+    }
+}
+
+static void profiler_internal_totals_sort_ascending( profiler_totals_t* totals, uintptr_t min, uintptr_t max ) {
+    
+    if ( min < max ) {
+        
+        uintptr_t pivot_index = ( min + max ) / 2;
+        uint64_t pivot_value = totals->cycles[ pivot_index ];
+        
+        uintptr_t low = min, high = max;
+        
+        while ( 1 ) {
+            
+            while ( totals->cycles[ low ] < pivot_value ) {
+                low++;
+            }
+            
+            while ( totals->cycles[ high ] > pivot_value ) {
+                high--;
+            }
+            
+            if ( low < high ) {
+                profiler_swap_type( totals->cycles[ low ], totals->cycles[ high ], uint64_t );
+                profiler_swap_type( totals->not_measured_cycles[ low ], totals->not_measured_cycles[ high ], uint64_t );
+                profiler_swap_type( totals->time[ low ], totals->time[ high ], uint64_t );
+                profiler_swap_type( totals->not_measured_time[ low ], totals->not_measured_time[ high ], uint64_t );
+                profiler_swap_type( totals->hits[ low ], totals->hits[ high ], uint64_t );
+                profiler_swap_type( totals->id[ low ], totals->id[ high ], uint32_t );
+                low++;
+                high--;
+            } else {
+                break;
+            }
+        }
+        
+        profiler_internal_totals_sort_ascending( totals, min, high );
+        profiler_internal_totals_sort_ascending( totals, high + 1, max );
+    }
+}
+
+static void profiler_internal_totals_sort_descending( profiler_totals_t* totals, uintptr_t min, uintptr_t max ) {
+    
+    if ( min < max ) {
+        
+        uintptr_t pivot_index = ( min + max ) / 2;
+        uint64_t pivot_value = totals->cycles[ pivot_index ];
+        
+        uintptr_t low = min, high = max;
+        
+        while ( 1 ) {
+            
+            while ( totals->cycles[ low ] > pivot_value ) {
+                low++;
+            }
+            
+            while ( totals->cycles[ high ] < pivot_value ) {
+                high--;
+            }
+            
+            if ( low < high ) {
+                profiler_swap_type( totals->cycles[ low ], totals->cycles[ high ], uint64_t );
+                profiler_swap_type( totals->not_measured_cycles[ low ], totals->not_measured_cycles[ high ], uint64_t );
+                profiler_swap_type( totals->time[ low ], totals->time[ high ], uint64_t );
+                profiler_swap_type( totals->not_measured_time[ low ], totals->not_measured_time[ high ], uint64_t );
+                profiler_swap_type( totals->hits[ low ], totals->hits[ high ], uint64_t );
+                profiler_swap_type( totals->id[ low ], totals->id[ high ], uint32_t );
+                low++;
+                high--;
+            } else {
+                break;
+            }
+        }
+        
+        profiler_internal_totals_sort_descending( totals, min, high );
+        profiler_internal_totals_sort_descending( totals, high + 1, max );
+    }
+}
+
+void profiler_totals_sort( profiler_totals_t* totals, uint32_t flags ) {
+    
+    if ( totals->element_count ) {
+        
+        if ( flags & profiler_sort_ascending ) {
+            profiler_internal_totals_sort_ascending( totals, 0, totals->element_count - 1 );
+        } else {
+            profiler_internal_totals_sort_descending( totals, 0, totals->element_count - 1 );
+        }
+    }
+}
+
+#undef profiler_swap_type
+
+static profiler_node_t* profiler_internal_build_tree_node( profiler_tool_t* tool, profiler_buffer_t* memory, profiler_node_t* parent, profiler_event_t* event, uintptr_t user_data_size, void* user_data_init, uint32_t* error ) {
+    
+    profiler_assert( memory->used + sizeof( profiler_node_t ) + user_data_size <= memory->reserved );
+    
+    profiler_node_t* node = profiler_buffer_push_struct( memory, profiler_node_t, error );
+    
+    if ( user_data_size ) {
+        node->user_data = profiler_buffer_push_size( memory, user_data_size, error );
+        profiler_memory_copy( node->user_data, user_data_init, user_data_size );
+    } else {
+        node->user_data = 0;
+    }
+    
+    profiler_assert( profiler_no_error( error ) );
+    
+    node->id = event->id;
+    node->flags = event->flags & ( profiler_event_flag_collapsable | profiler_event_flag_collapsed );
+    node->child_count = 0;
+    node->parent = parent;
+    node->first_child = 0;
+    node->next_sibling = 0;
+    node->last_child = 0;
+    
+    node->start_cycles = event->cycles;
+    node->end_cycles = 0;
+    node->childs_cycles = 0;
+    
+    node->start_time = profiler_cycles_to_time( tool, event->cycles );
+    node->end_time = 0;
+    node->childs_time = 0;
+    
+    if ( !parent->first_child ) {
+        parent->first_child = node;
+    } else {
+        parent->last_child->next_sibling = node;
+    }
+    
+    parent->last_child = node;
+    parent->child_count++;
+    
+    return node;
+}
+
+profiler_node_t* profiler_build_tree( profiler_tool_t* tool, void* events, uintptr_t event_size, void* user_data_init, uintptr_t user_data_size, profiler_buffer_t* tree_memory, profiler_totals_t* totals, uint32_t* error ) {
+    
+    profiler_node_t* result = 0;
+    
+    if ( profiler_no_error( error ) ) {
+        
+        profiler_event_t* current_event = ( profiler_event_t* ) events;
+        profiler_event_t* end_event = ( profiler_event_t* ) ( ( uint8_t* ) events + event_size );
+        
+        profiler_assert( tree_memory );
+        profiler_assert( tree_memory->reserved == 0 );
+        profiler_assert( tree_memory->used == 0 );
+        profiler_assert( tree_memory->bytes == 0 );
+        
+        tree_memory->reserved = ( ( ( end_event - current_event ) / 2 ) + 1 ) * ( sizeof( profiler_node_t ) + user_data_size );
+        tree_memory->bytes = ( uint8_t* ) profiler_get_memory( tree_memory->reserved );
+        
+        if ( !tree_memory->bytes ) {
+            profiler_set_error( error, profiler_error_get_memory_failed );
+        } else {
+            
+            if ( totals ) {
+                profiler_totals_initialize( tool, totals, error );
+            }
+            
+            if ( profiler_is_error( error ) ) {
+                
+                profiler_free_memory( tree_memory->bytes, tree_memory->reserved );
+                tree_memory->reserved = tree_memory->used = 0;
+                tree_memory->bytes = 0;
+                
+            } else {
+                
+                /* NOTE simon: No error checking since we reserved sufficent space. */
+                result = profiler_buffer_push_struct( tree_memory, profiler_node_t, error );
+                profiler_node_t dummy = { 0 };
+                *result = dummy;
+                
+                if ( user_data_size ) {
+                    result->user_data = profiler_buffer_push_size( tree_memory, user_data_size, error );
+                    profiler_memory_copy( result->user_data, user_data_init, user_data_size );
+                }
+                
+                profiler_node_t* current_node = result;
+                
+                while ( current_event < end_event ) {
+                    
+                    if ( current_event->flags & profiler_event_flag_start ) {
+                        
+                        current_node = profiler_internal_build_tree_node( tool, tree_memory, current_node, current_event, user_data_size, user_data_init, error );
+                        
+                        if ( totals ) {
+                            
+                            if ( !totals->in_parent[ current_node->id ] ) {
+                                totals->in_parent[ current_node->id ] = current_node;
+                            }
+                            
+                            totals->hits[ current_node->id ]++;
+                        }
+                        
+                    } else {
+                        
+                        current_node->end_cycles = current_event->cycles;
+                        profiler_assert( current_node->end_cycles > current_node->start_cycles );
+                        current_node->end_time = profiler_cycles_to_time( tool, current_event->cycles );
+                        
+                        if ( totals ) {
+                            
+                            if ( totals->in_parent[ current_node->id ] == current_node ) {
+                                
+                                uint64_t cycles = current_node->end_cycles - current_node->start_cycles;
+                                totals->cycles[ current_node->id ] += cycles;
+                                totals->not_measured_cycles[ current_node->id ] += ( cycles - current_node->childs_cycles );
+                                
+                                uint64_t time = current_node->end_time - current_node->start_time;
+                                totals->time[ current_node->id ] += time;
+                                totals->not_measured_time[ current_node->id ] += ( time - current_node->childs_time );
+                                
+                                totals->in_parent[ current_node->id ] = 0;
+                            }
+                        }
+                        
+                        current_node->parent->childs_cycles += ( current_node->end_cycles - current_node->start_cycles );
+                        current_node->parent->childs_time += ( current_node->end_time - current_node->start_time );
+                        current_node = current_node->parent;
+                    }
+                    
+                    current_event++;
+                }
+                
+                profiler_assert( current_node == result );
+                
+                if ( result->first_child ) {
+                    result->start_cycles = result->first_child->start_cycles;
+                    result->end_cycles = result->last_child->end_cycles;
+                    result->start_time = result->first_child->start_time;
+                    result->end_time = result->last_child->end_time;
+                }
+                
+                if ( totals ) {
+                    totals->cycles[ 1 ] = ( result->end_cycles - result->start_cycles ) - result->childs_cycles;
+                    totals->time[ 1 ] = ( result->end_time - result->start_time ) - result->childs_time;
+                    profiler_totals_compact( totals );
+                    profiler_totals_sort( totals, profiler_sort_descending );
+                }
+                
+                uint64_t root_cycles = result->end_cycles - result->start_cycles;
+                
+                if ( root_cycles > tool->max_cycles ) {
+                    tool->max_cycles = root_cycles;
+                    tool->max_time = result->end_time - result->start_time;
+                }
+                
+                profiler_assert( tree_memory->used == tree_memory->reserved );
+            }
+        }
+    }
+    
+    return result;
+}
+
+void profiler_tool_initialize_meta( profiler_tool_t* tool, void* meta, uintptr_t meta_size, uint32_t* error ) {
+    
+    if ( profiler_no_error( error ) ) {
+        
+        profiler_buffer_t meta_buffer = profiler_buffer_make( meta_size, 0, meta, error );
+        
+        uint64_t timeline_id_string_buffer_size = 0, event_id_string_buffer_size = 0;
+        
+        profiler_buffer_read_u32( &meta_buffer, &tool->timeline_id_count, error );
+        profiler_buffer_read_u32( &meta_buffer, &tool->timeline_count, error );
+        profiler_buffer_read_u32( &meta_buffer, &tool->event_id_count, error );
+        profiler_buffer_read_u64( &meta_buffer, &timeline_id_string_buffer_size, error );
+        profiler_buffer_read_u64( &meta_buffer, &event_id_string_buffer_size, error );
+        
+        if ( profiler_no_error( error ) ) {
+            
+            tool->memory.reserved =
+                tool->timeline_id_count * ( sizeof( uint16_t ) + sizeof( uint8_t* ) ) + timeline_id_string_buffer_size
+                + tool->timeline_count * ( sizeof( uint64_t ) + sizeof( uint32_t ) + sizeof( profiler_node_t** ) )
+                + tool->timeline_count * sizeof( profiler_buffer_t )
+                + tool->event_id_count * ( sizeof( uint16_t ) + sizeof( uint8_t* ) ) + event_id_string_buffer_size
+                + tool->timeline_count * sizeof( profiler_totals_t );
+            tool->memory.used =  0;
+            tool->memory.bytes = ( uint8_t* ) profiler_get_memory( tool->memory.reserved );
+            
+            if ( !tool->memory.bytes ) {
+                profiler_set_error( error, profiler_error_get_memory_failed );
+            }
+        }
+        
+        if ( profiler_no_error( error ) ) {
+            
+            tool->timeline_id_string_lengths = profiler_buffer_push_array( &tool->memory, uint16_t, tool->timeline_id_count, error );
+            profiler_buffer_read_array( &meta_buffer, uint16_t, tool->timeline_id_count, tool->timeline_id_string_lengths, error );
+            tool->timeline_id_strings = profiler_buffer_push_array( &tool->memory, uint8_t*, tool->timeline_id_count, error );
+            
+            for ( uintptr_t i = 0; i < tool->timeline_id_count; i++ ) {
+                
+                uint16_t length = tool->timeline_id_string_lengths[ i ];
+                tool->timeline_id_strings[ i ] = ( uint8_t* ) profiler_buffer_push_size( &tool->memory, length, error );
+                profiler_buffer_read_size( &meta_buffer, length, tool->timeline_id_strings[ i ], error );
+                
+                if ( length > tool->max_timeline_id_string_length ) {
+                    tool->max_timeline_id_string_length = length;
+                }
+            }
+            
+            tool->timeline_sizes = profiler_buffer_push_array( &tool->memory, uint64_t, tool->timeline_count, error );
+            profiler_buffer_read_array( &meta_buffer, uint64_t, tool->timeline_count, tool->timeline_sizes, error );
+            tool->timeline_ids = profiler_buffer_push_array( &tool->memory, uint32_t, tool->timeline_count, error );
+            profiler_buffer_read_array( &meta_buffer, uint32_t, tool->timeline_count, tool->timeline_ids, error );
+            
+            tool->event_id_string_lengths = profiler_buffer_push_array( &tool->memory, uint16_t, tool->event_id_count, error );
+            profiler_buffer_read_array( &meta_buffer, uint16_t, tool->event_id_count, tool->event_id_string_lengths, error );
+            tool->event_id_strings = profiler_buffer_push_array( &tool->memory, uint8_t*, tool->event_id_count, error );
+            
+            for ( uintptr_t i = 0; i < tool->event_id_count; i++ ) {
+                
+                uint16_t length = tool->event_id_string_lengths[ i ];
+                tool->event_id_strings[ i ] = ( uint8_t* ) profiler_buffer_push_size( &tool->memory, length, error );
+                profiler_buffer_read_size( &meta_buffer, length, tool->event_id_strings[ i ], error );
+                
+                if ( length > tool->max_event_id_string_length ) {
+                    tool->max_event_id_string_length = length;
+                }
+            }
+            
+            profiler_buffer_read_u64( &meta_buffer, &tool->frequency, error );
+            profiler_buffer_read_u64( &meta_buffer, &tool->fallback_cycles, error );
+            profiler_buffer_read_u64( &meta_buffer, &tool->fallback_time, error );
+            profiler_buffer_read_u8( &meta_buffer, &tool->platform, error );
+            
+            profiler_buffer_read_u8( &meta_buffer, &tool->platform_data.windows.version, error );
+            profiler_buffer_read_u8( &meta_buffer, &tool->platform_data.windows.qpc_shift, error );
+            profiler_buffer_read_u64( &meta_buffer, &tool->platform_data.windows.qpc_bias, error );
+            profiler_buffer_read_u64( &meta_buffer, &tool->platform_data.windows.mul128, error );
+            profiler_buffer_read_u64( &meta_buffer, &tool->platform_data.windows.add, error );
+            
+            profiler_buffer_read_u32( &meta_buffer, &tool->platform_data.linux_.mult, error );
+            profiler_buffer_read_u32( &meta_buffer, &tool->platform_data.linux_.shift, error );
+            
+            profiler_assert( meta_buffer.used == meta_buffer.reserved );
+            
+            tool->timelines = ( profiler_node_t** ) profiler_buffer_push_array( &tool->memory, profiler_node_t*, tool->timeline_count, error );
+            tool->totals = ( profiler_totals_t* ) profiler_buffer_push_array( &tool->memory, profiler_totals_t, tool->timeline_count, error );
+            tool->timelines_memory = ( profiler_buffer_t* ) profiler_buffer_push_array( &tool->memory, profiler_buffer_t, tool->timeline_count, error );
+            
+            profiler_buffer_t memory = { 0 };
+            profiler_totals_t totals = { 0 };
+            
+            for ( uintptr_t i = 0; i < tool->timeline_count; i++ ) {
+                tool->timelines[ i ] = 0;
+                tool->timelines_memory[ i ] = memory;
+                tool->totals[ i ] = totals;
+            }
+            
+            profiler_assert( tool->memory.used == tool->memory.reserved );
+            profiler_assert( profiler_no_error( error ) );
+            
+            tool->print_event_id_width = ( tool->max_event_id_string_length < 40 ) ? 40 : tool->max_event_id_string_length;
+            tool->indent_space_count = 2;
+            
+            if ( profiler_is_error( error ) ) {
+                profiler_assert( *error == profiler_error_buffer_not_enough_memory );
+                profiler_free_memory( tool->memory.bytes, tool->memory.reserved );
+                tool->memory.reserved = tool->memory.used = 0;
+                tool->memory.bytes = 0;
+            }
+        }
+    }
+}
+
+static void profiler_internal_tool_initialize_print_sizes( profiler_tool_t* tool ) {
+    
+    tool->print_cycles_size = 0;
+    
+    uint64_t max_cycles = tool->max_cycles;
+    
+    while ( max_cycles > 0 ) {
+        tool->print_cycles_size++;
+        max_cycles /= 10;
+    }
+    
+    tool->print_time_integer_size = 1; /* NOTE simon: At least 1 character for the sign (double printout stuff). */
+    
+    uint64_t max_time = tool->max_time / tool->frequency;
+    
+    while ( max_time > 0 ) {
+        tool->print_time_integer_size = 0;
+        max_time /= 10;
+    }
+}
+
+profiler_tool_t profiler_tool_initialize_from_file( void* profile, uintptr_t profile_size, void* user_data_init, uintptr_t user_data_size, uint32_t* error ) {
+    
+    profiler_tool_t tool = { 0 };
+    profiler_buffer_t file = profiler_buffer_make( profile_size, 0, profile, error );
+    
+    if ( profiler_no_error( error ) ) {
+        
+        uint32_t signature = 0, version = 0;
+        profiler_buffer_read_u32( &file, &signature, error );
+        profiler_buffer_read_u32( &file, &version, error );
+        
+        if ( profiler_no_error( error ) ) {
+            
+            uint32_t signature_check = ( 'P' ) | ( 'R' << 8 ) | ( 'O' << 16 ) | ( 'F' << 24 );
+            
+            if ( signature != signature_check ) {
+                profiler_set_error( error, profiler_error_file_invalid_signature );
+            } else if ( version != 1 ) {
+                profiler_set_error( error, profiler_error_file_unsupported_version );
+            }
+            
+            if ( profiler_no_error( error ) ) {
+                
+                uint64_t meta_size = 0, meta_offset = 0;
+                uint64_t timelines_size = 0, timelines_offset = 0;
+                
+                profiler_buffer_read_u64( &file, &meta_size, error );
+                profiler_buffer_read_u64( &file, &meta_offset, error );
+                profiler_buffer_read_u64( &file, &timelines_size, error );
+                profiler_buffer_read_u64( &file, &timelines_offset, error );
+                
+                void* meta = ( void* ) ( file.bytes + meta_offset );
+                void* timelines = ( void* ) ( file.bytes + timelines_offset );
+                
+                profiler_tool_initialize_meta( &tool, meta, meta_size, error );
+                
+                if ( profiler_no_error( error ) ) {
+                    
+                    profiler_assert( ( timelines_size % 16 ) == 0 );
+                    profiler_assert( ( ( ( uint64_t ) timelines ) % 16 ) == 0 );
+                    
+                    profiler_buffer_t timelines_buffer = profiler_buffer_make( timelines_size, 0, timelines, error );
+                    
+                    for ( uintptr_t i = 0; profiler_no_error( error ) && i < tool.timeline_count; i++ ) {
+                        
+                        uintptr_t timeline_size = tool.timeline_sizes[ i ];
+                        profiler_event_t* timeline = ( profiler_event_t* ) profiler_buffer_push_size( &timelines_buffer, timeline_size, error );
+                        
+                        if ( profiler_no_error( error ) ) {
+                            tool.timelines[ i ] = profiler_build_tree( &tool, timeline, timeline_size, user_data_init, user_data_size, tool.timelines_memory + i, tool.totals + i, error );
+                        }
+                    }
+                    
+                    profiler_assert( timelines_buffer.used == timelines_buffer.reserved );
+                    
+                    profiler_internal_tool_initialize_print_sizes( &tool );
+                }
+            }
+        }
+    }
+    
+    return tool;
+}
+
+void profiler_tool_free_memory( profiler_tool_t* tool ) {
+    
+    for ( uintptr_t i = 0; i < tool->timeline_count; i++ ) {
+        
+        if ( tool->timelines_memory[ i ].bytes && tool->timelines_memory[ i ].reserved ) {
+            profiler_free_memory( tool->timelines_memory[ i ].bytes, tool->timelines_memory[ i ].reserved );
+        }
+        
+        profiler_totals_free( tool->totals + i );
+    }
+    
+    if ( tool->memory.bytes && tool->memory.reserved ) {
+        profiler_free_memory( tool->memory.bytes, tool->memory.reserved );
+    }
+    
+    tool->timeline_id_strings = 0;
+    tool->timeline_id_string_lengths = 0;
+    
+    tool->event_id_strings = 0;
+    tool->event_id_string_lengths = 0;
+    
+    tool->timeline_sizes = 0;
+    tool->timelines = 0;
+    tool->timelines_memory = 0;
+    tool->timeline_ids = 0;
+    
+    tool->totals = 0;
+}
+
+uintptr_t profiler_print_timeline( profiler_tool_t* tool, uintptr_t timeline_index, void* buffer, uintptr_t size, uint32_t* error ) {
+    
+    profiler_buffer_t out = profiler_buffer_make( size, 0, buffer, error );
+    
+    if ( profiler_no_error( error ) ) {
+        
+        profiler_node_t* timeline = tool->timelines[ timeline_index ];
+        
+        profiler_buffer_push_string_l( &out, "Timeline[ ", error );
+        profiler_buffer_push_u64( &out, timeline_index, 0, 0, 0, error );
+        profiler_buffer_push_string_l( &out, " ] - ", error );
+        uint8_t* timeline_id_string = tool->timeline_id_strings[ tool->timeline_ids[ timeline_index ] ];
+        uintptr_t timeline_id_string_length = tool->timeline_id_string_lengths[ tool->timeline_ids[ timeline_index ] ];
+        profiler_buffer_push_string_p( &out, timeline_id_string, timeline_id_string_length, error );
+        profiler_buffer_push_string_l( &out, "\n\n", error );
+        
+        profiler_assert( tool->frequency );
+        double frequency = ( double ) tool->frequency;
+        
+        profiler_buffer_push_string_l( &out, "# Totals\n", error );
+        
+        profiler_totals_t* totals = tool->totals + timeline_index;
+        
+        for ( uintptr_t i = 0; i < totals->element_count; i++ ) {
+            
+            uint32_t id_index = totals->id[ i ];
+            uint64_t cycles = totals->cycles[ i ];
+            uint64_t time = totals->time[ i ];
+            
+            if ( cycles ) {
+                
+                uintptr_t diff = tool->max_event_id_string_length - tool->event_id_string_lengths[ id_index ];
+                profiler_buffer_push_string_p( &out, tool->event_id_strings[ id_index ], tool->event_id_string_lengths[ id_index ], error );
+                
+                uint8_t* spaces = ( uint8_t* ) profiler_buffer_push_size( &out, diff, error );
+                
+                if ( profiler_no_error( error ) ) {
+                    
+                    for ( uintptr_t s = 0; s < diff; s++ ) {
+                        *spaces = ' ';
+                        spaces++;
+                    }
+                }
+                
+                profiler_buffer_push_string_l( &out, " | ", error );
+                profiler_buffer_push_u64( &out, totals->hits[ i ], 10, ' ', 0, error );
+                profiler_buffer_push_string_l( &out, "h | ", error );
+                profiler_buffer_push_u64( &out, cycles, tool->print_cycles_size, ' ', 0, error );
+                profiler_buffer_push_string_l( &out, "c | ", error );
+                profiler_buffer_push_u64( &out, ( totals->hits[ i ] ) ? cycles / totals->hits[ i ] : 0, tool->print_cycles_size, ' ', 0, error );
+                profiler_buffer_push_string_l( &out, "c/h | ", error );
+                profiler_buffer_push_r64( &out, ( double ) time / frequency, tool->print_time_integer_size, ' ', 9, error );
+                profiler_buffer_push_string_l( &out, "s | ", error );
+                profiler_buffer_push_r64( &out, ( totals->hits[ i ] ) ? ( double ) time / ( frequency * ( double )  totals->hits[ i ] ) : 0, tool->print_time_integer_size, ' ', 9, error );
+                profiler_buffer_push_string_l( &out, "s/h | ", error );
+                
+                float percentage = ( float ) cycles / ( float ) totals->cycles[ 0 ];
+                uintptr_t step_count = 20;
+                float step_value = ( 1.0f / step_count );
+                
+                for ( uintptr_t step = 0; step < step_count; step++ ) {
+                    
+                    if ( percentage >= step_value - 0.001f ) {
+                        profiler_buffer_write_u8( &out, '=', error );
+                        percentage -= step_value;
+                    } else {
+                        profiler_buffer_write_u8( &out, ' ', error );
+                    }
+                }
+                
+                profiler_buffer_push_string_l( &out, " |\n", error );
+            }
+        }
+        
+        profiler_buffer_push_string_l( &out, "\n# Tree\n", error );
+        
+        uintptr_t indent_level = 0;
+        profiler_print_node( tool, &out, timeline, indent_level, error );
+        
+        profiler_assert( profiler_no_error( error ) );
+    }
+    
+    return out.used;
+}
+
+uintptr_t profiler_print_from_tool( profiler_tool_t* tool, void* buffer, uintptr_t size, uint32_t* error ) {
+    
+    profiler_buffer_t out = profiler_buffer_make( size, 0, buffer, error );
+    
+    for ( uintptr_t timeline_index = 0; profiler_no_error( error ) && timeline_index < tool->timeline_count; timeline_index++ ) {
+        
+        uintptr_t used = profiler_print_timeline( tool, timeline_index, out.bytes + out.used, out.reserved - out.used, error );
+        out.used += used;
+        profiler_buffer_push_string_l( &out, "\n----------------------------------------------------------------------------------------------------\n", error );
+    }
+    
+    return out.used;
+}
+
+profiler_node_t* profiler_node_find_breadth_first( profiler_node_t* current, uintptr_t id ) {
+    
+    profiler_node_t* result = 0;
+    profiler_node_t* child = current->first_child;
+    
+    while ( !result && child ) {
+        
+        if ( child->id == id ) {
+            result = child;
+        } else {
+            child = child->next_sibling;
+        }
+    }
+    
+    child = current->first_child;
+    
+    while ( !result && child ) {
+        result = profiler_node_find_breadth_first( child, id );
+        child = child->next_sibling;
+    }
+    
+    return result;
+}
+
+profiler_node_t* profiler_node_find_depth_first( profiler_node_t* current, uintptr_t id ) {
+    
+    profiler_node_t* result = 0;
+    
+    if ( current->id == id && current->parent ) {
+        result = current;
+    } else {
+        
+        profiler_node_t* child = current->first_child;
+        
+        for ( uintptr_t i = 0; !result && i < current->child_count; i++ ) {
+            result = profiler_node_find_depth_first( child, id );
+            child = child->next_sibling;
+        }
+    }
+    
+    return result;
+}
+
+profiler_node_iterator_t profiler_node_iterator_make( profiler_node_t* root ) {
+    
+    profiler_node_iterator_t result;
+    result.root = root;
+    result.current = root;
+    
+    return result;
+}
+
+profiler_node_t* profiler_node_iterator_next_depth_first( profiler_node_iterator_t* iterator ) {
+    
+    profiler_node_t* current = iterator->current;
+    
+    if ( current ) {
+        
+        if ( current->first_child ) {
+            
+            iterator->current = current->first_child;
+            
+        } else {
+            
+            if ( !current->next_sibling ) {
+                
+                while ( current != iterator->root && !current->next_sibling ) {
+                    current = current->parent;
+                }
+            }
+            
+            if ( current != iterator->root && current->next_sibling ) {
+                iterator->current = current->next_sibling;
+            } else {
+                profiler_assert( current == iterator->root );
+                iterator->current = 0;
+            }
+        }
+    }
+    
+    return iterator->current;
+}
+
+profiler_node_t* profiler_node_iterator_next_breadth_first( profiler_node_iterator_t* iterator ) {
+    
+    profiler_node_t* current = iterator->current;
+    
+    if ( current ) {
+        
+        if ( current == iterator->root ) {
+            current = current->first_child;
+        } else {
+            
+            if ( current->next_sibling ) {
+                current = current->next_sibling;
+            } else {
+                
+                current = current->parent->first_child;
+                
+                while ( !current->first_child && current->next_sibling ) {
+                    current = current->next_sibling;
+                }
+                
+                if ( current->first_child ) {
+                    current = current->first_child;
+                } else {
+                    
+                    while ( current != iterator->root ) {
+                        
+                        current = current->parent;
+                        
+                        if ( current->next_sibling ) {
+                            
+                            current = current->next_sibling;
+                            
+                            while ( !current->first_child && current->next_sibling ) {
+                                current = current->next_sibling;
+                            }
+                            
+                            if ( current->first_child ) {
+                                current = current->first_child;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if ( current == iterator->root ) {
+                        current = 0;
+                    }
+                }
+            }
+        }
+        
+        iterator->current = current;
+    }
+    
+    return iterator->current;
+}
+
+#ifdef PROFILER_ON
+
+/* NOTE simon:
+Intel® 64 and IA-32 Architectures Software Developer’s Manual Volume 2, page 300 (3-198)
+Intel® 64 and IA-32 Architectures Software Developer’s Manual Volume 3, chapter 17.17 and 18.7.3.2
+The intel documentation indicates that CPUID.0x15 contains info to know the tsc frequency that would
+allow to convert to seconds (possibly finding the value used in QPC) but CPUID.0x15 isn't supported
+on my CPU.
+
+The doc says that I could retrive the frequency using MSR_PLATFORM_INFO but it needs to use __rdmsr
+and that requires to run in kernel mode.
+*/
+
+#if defined( PROFILER_WINDOWS )
+
+/* From profileapi.h */
+typedef union _LARGE_INTEGER LARGE_INTEGER;
+
+profiler_extern_c __declspec( dllimport ) int QueryPerformanceCounter( LARGE_INTEGER* lpPerformanceCount );
+profiler_extern_c __declspec( dllimport ) int QueryPerformanceFrequency( LARGE_INTEGER* lpFrequency );
+
+void profiler_get_frequency( uint64_t* frequency ) {
+    QueryPerformanceFrequency( ( LARGE_INTEGER* ) frequency );
+}
+
+void profiler_get_time( uint64_t* time ) {
+    QueryPerformanceCounter( ( LARGE_INTEGER* ) time );
+}
+
+/* From winnt.h */
+long _InterlockedIncrement( long volatile *Addend );
+profiler_ctassert( sizeof( long ) == 4 );
+
+#define profiler_atomic_increment_32( pointer ) _InterlockedIncrement( ( long volatile* ) pointer )
+
+#elif defined( PROFILER_LINUX )
+
+#include <time.h>
+
+void profiler_get_frequency( uint64_t* frequency ) {
+    /* NOTE simon: The time returned by profiler_get_time is in nanosec. */
+    ( *frequency ) = 1000000000;
+}
+
+void profiler_get_time( uint64_t* time ) {
+    struct timespec spec;
+    clock_gettime( CLOCK_MONOTONIC, &spec );
+    ( *time ) = spec.tv_sec * ( uint64_t ) 1000000000 + spec.tv_nsec;
+}
+
+/* NOTE simon: was __sync_add_and_fetch( ( pointer ), 1 ) */
+#define profiler_atomic_increment_32( pointer ) __atomic_add_fetch( pointer, 1, __ATOMIC_SEQ_CST );
+
+#else
+# error Unsupported platform.
+#endif
+
+uint64_t profiler_get_cycles( void ) {
+    uint32_t tsc_aux;
+    return __rdtscp( &tsc_aux );
+}
+
+profiler_thread_local_storage profiler_timeline_t* profiler_timeline = 0;
+
+profiler_state_t profiler_global_state = { 0 };
+
+void profiler_timeline_initialize_disabled( uint32_t id, uintptr_t maximum_event_count, uint32_t* error ) {
+    uint32_t index = ( uint32_t ) profiler_atomic_increment_32( ( int32_t volatile* ) &profiler_global_state.timeline_count );
+    profiler_timeline = profiler_global_state.timelines + ( index - 1 );
+    profiler_disable_for_current_timeline( profiler_enable_all );
+}
+
+void profiler_timeline_initialize_( uint32_t id, uintptr_t maximum_event_count, uint32_t* error ) {
+    
+    if ( profiler_no_error( error ) ) {
+        
+        profiler_assert( profiler_global_state.is_initialized );
+        profiler_assert( profiler_global_state.timeline_count < PROFILER_MAX_TIMELINE_COUNT );
+        profiler_assert( !profiler_timeline );
+        
+        profiler_assert( profiler_global_state.timeline_count < 0xffff );
+        
+        uint32_t index = ( uint32_t ) profiler_atomic_increment_32( ( int32_t volatile* ) &profiler_global_state.timeline_count );
+        profiler_timeline = profiler_global_state.timelines + ( index - 1 );
+        
+        profiler_timeline->start = ( profiler_event_t* ) profiler_get_memory( sizeof( profiler_event_t ) * maximum_event_count );
+        profiler_assert( profiler_timeline->start );
+        
+        if ( !profiler_timeline->start ) {
+            profiler_set_error( error, profiler_error_get_memory_failed );
+            profiler_timeline->event_start_function = profiler_event_no_op;
+            profiler_timeline->event_end_function = profiler_event_no_op;
+            profiler_timeline->collapsable_start_function = profiler_collapsable_no_op;
+            profiler_timeline->collapsable_end_function = profiler_collapsable_no_op;
+        } else {
+            
+            profiler_timeline->current = profiler_timeline->start;
+            profiler_timeline->end = profiler_timeline->start + maximum_event_count;
+            profiler_timeline->id = id;
+            
+#if defined( PROFILER_DEBUG )
+            profiler_timeline->pair_check = ( uint32_t* ) profiler_get_memory( sizeof( uint32_t ) * profiler_event_id_count );
+            profiler_assert( profiler_timeline->pair_check );
+#endif
+            
+            profiler_timeline->event_start_function = profiler_event_start_;
+            profiler_timeline->event_end_function = profiler_event_end_;
+            profiler_timeline->collapsable_start_function = profiler_collapsable_start_;
+            profiler_timeline->collapsable_end_function = profiler_collapsable_end_;
+        }
+    }
+}
+
+profiler_timeline_initialize_t* profiler_timeline_initialize_function = profiler_timeline_initialize_;
+
+#if defined( PROFILER_WINDOWS )
+
+typedef __int64 INT_PTR;
+typedef __int64 ( __stdcall *FARPROC )( );
+
+struct HINSTANCE__;
+typedef struct HINSTANCE__* HMODULE;
+
+profiler_extern_c __declspec( dllimport ) HMODULE __stdcall LoadLibraryA( const char* LibFileName );
+profiler_extern_c __declspec( dllimport ) int __stdcall FreeLibrary( _In_ HMODULE hLibModule );
+profiler_extern_c __declspec( dllimport ) FARPROC __stdcall GetProcAddress( HMODULE hModule, const char* ProcName );
+
+#elif defined( PROFILER_LINUX )
+
+#include <sys/auxv.h>
+#include <sys/utsname.h>
+
+#else
+#error Unsupported platform.
+#endif
+
+void profiler_initialize_disabled( uint32_t id, uintptr_t main_thread_max_event_count, uint32_t* error ) {
+    profiler_timeline_initialize_disabled( id, main_thread_max_event_count, error );
+}
+
+void profiler_initialize_( uint32_t id, uintptr_t main_thread_max_event_count, uint32_t* error ) {
+    
+    profiler_get_frequency( &profiler_global_state.frequency );
+    profiler_global_state.id_count = profiler_event_id_count;
+    profiler_global_state.timeline_id_count = profiler_timeline_id_count;
+    
+    profiler_global_state.platform = profiler_platform_fallback;
+    profiler_global_state.fallback_cycles = profiler_get_cycles( );
+    profiler_get_time( &profiler_global_state.fallback_time );
+    
+#if defined( PROFILER_WINDOWS )
+    
+    profiler_global_state.platform = profiler_platform_windows;
+    
+    uint8_t* SharedUserData = ( uint8_t* ) 0x7ffe0000;
+    uint32_t kernel_major = *( uint32_t* ) ( SharedUserData + 0x026c );
+    uint32_t kernel_minor = *( uint32_t* ) ( SharedUserData + 0x0270 );
+    
+    if ( kernel_major == 6 && kernel_minor == 1 ) {
+        
+        profiler_global_state.platform_data.windows.version = profiler_windows_version_7;
+        profiler_global_state.platform_data.windows.qpc_bias = *( uint64_t* ) ( SharedUserData + 0x03b8 );
+        profiler_global_state.platform_data.windows.qpc_shift = *( SharedUserData + 0x02ed );
+        profiler_global_state.platform_data.windows.qpc_shift >>= 2;
+        profiler_global_state.platform_data.windows.mul128 = 0;
+        profiler_global_state.platform_data.windows.add = 0;
+        
+    } else if ( kernel_major == 6 && ( kernel_minor == 2 || kernel_minor == 3 ) ) {
+        
+        profiler_global_state.platform_data.windows.version = profiler_windows_version_8;
+        profiler_global_state.platform_data.windows.qpc_bias = *( uint64_t* ) ( SharedUserData + 0x03b8 );
+        profiler_global_state.platform_data.windows.qpc_shift = *( SharedUserData + 0x03c7 );
+        profiler_global_state.platform_data.windows.mul128 = 0;
+        profiler_global_state.platform_data.windows.add = 0;
+        
+    } else if ( kernel_major == 10 ) {
+        
+        uint32_t win_10_build_number = *( uint32_t* ) ( SharedUserData + 0x0260 );
+        
+        if ( win_10_build_number > 14393 ) {
+            
+            profiler_global_state.platform_data.windows.version = profiler_windows_version_10;
+            
+            typedef int32_t __stdcall NtQuerySystemInformation_t( int32_t SystemInformationClass, void* SystemInformation, uint32_t SystemInformationLength, uint32_t* ReturnLength );
+            
+            HMODULE ntdll = LoadLibraryA( "ntdll.dll" );
+            NtQuerySystemInformation_t* NtQuerySystemInformation = ( NtQuerySystemInformation_t* ) GetProcAddress( ntdll, "NtQuerySystemInformation" );
+            FreeLibrary( ntdll );
+            profiler_assert( NtQuerySystemInformation );
+            uint64_t system_information;
+            uint32_t out_size;
+            int32_t SystemHypervisorSharedPageInformation = 0xc5;
+            int32_t result = NtQuerySystemInformation( SystemHypervisorSharedPageInformation, &system_information, sizeof( system_information ), &out_size );
+            profiler_assert( out_size == sizeof( system_information ) );
+            
+            volatile uint8_t* RtlpHypervisorSharedUserVa = ( uint8_t* ) system_information;
+            profiler_assert( RtlpHypervisorSharedUserVa );
+            
+            profiler_global_state.platform_data.windows.qpc_bias = *( uint64_t* ) ( SharedUserData + 0x03b8 );
+            profiler_global_state.platform_data.windows.qpc_shift = *( SharedUserData + 0x03c7 );
+            
+            profiler_global_state.platform_data.windows.mul128 = *( uint64_t* ) ( RtlpHypervisorSharedUserVa + 0x08 );
+            profiler_global_state.platform_data.windows.add = *( uint64_t* ) ( RtlpHypervisorSharedUserVa + 0x10 );
+            
+        } else {
+            
+            profiler_global_state.platform_data.windows.version = profiler_windows_version_8;
+            profiler_global_state.platform_data.windows.qpc_bias = *( uint64_t* ) ( SharedUserData + 0x03b8 );
+            profiler_global_state.platform_data.windows.qpc_shift = *( SharedUserData + 0x03c7 );
+            profiler_global_state.platform_data.windows.mul128 = 0;
+            profiler_global_state.platform_data.windows.add = 0;
+        }
+        
+    } else {
+        
+        profiler_global_state.platform = profiler_platform_fallback;
+    }
+    
+#elif defined( PROFILER_LINUX )
+    
+    /* NOTE simon: find the kernel version. */
+    uint32_t kernel_major = 5;
+    uint32_t kernel_minor = 9;
+    
+    struct utsname info;
+    
+    if ( uname( &info ) >= 0 ) {
+        
+        uint32_t major = 0;
+        uint32_t minor = 0;
+        char* version = info.release;
+        
+        while ( *version && *version != '.' ) {
+            
+            char c = *version;
+            
+            if ( c >= '0' && c <= '9' ) {
+                major *= 10;
+                major += ( c - '0' );
+            }
+            
+            version++;
+        }
+        
+        version++;
+        
+        while ( *version && *version != '.' ) {
+            
+            char c = *version;
+            
+            if ( c >= '0' && c <= '9' ) {
+                minor *= 10;
+                minor += ( c - '0' );
+            }
+            
+            version++;
+        }
+        
+        if ( major ) {
+            kernel_major = major;
+            kernel_minor = minor;
+        }
+    }
+    
+    /* NOTE simon: get the vdso data offset from the kernel version.
+       The offset may change in future version of the kernel.
+       None of this was properly tested. */
+    intptr_t page_size = 1 << 12;
+    intptr_t offset = -4 * page_size;
+    uint32_t use_fallback = 0;
+    
+    if ( kernel_major == 5 ) {
+        
+        if ( kernel_minor > 5 ) {
+            offset = -4 * page_size;
+        } else {
+            offset = -3 * page_size;
+        }
+        
+    } else if ( kernel_major == 4 ) {
+        
+        if ( kernel_minor > 11 ) {
+            offset = -3 * page_size;
+        } else if ( kernel_minor > 6 ) {
+            offset = -2 * page_size;
+        } else if ( kernel_minor > 4 ) {
+            offset = -3 * page_size;
+        } else if ( kernel_minor > 1 ) {
+            offset = -2 * page_size;
+        } else {
+            use_fallback = 1;
+        }
+    } else {
+        use_fallback = 1;
+    }
+    
+    if ( !use_fallback ) {
+        
+        profiler_global_state.platform = profiler_platform_linux;
+        
+        offset += 128;
+        
+        uint8_t* vdso = ( uint8_t* ) getauxval( AT_SYSINFO_EHDR );
+        
+        if ( vdso ) {
+            
+            uint8_t* vdso_data = vdso + offset;
+            
+            /* NOTE simon: The vdso_data struct starts like this:
+            struct vdso_data {
+                uint32_t seq;
+                int32_t clock_mode;
+                uint64_t cycle_last;
+                uint64_t mask;
+                uint32_t mult;
+                uint32_t shift;
+                ...
+            };
+            */
+            uint64_t mult_offset = sizeof( uint32_t ) + sizeof( int32_t ) + sizeof( uint64_t ) + sizeof( uint64_t );
+            uint64_t shift_offset = mult_offset + sizeof( uint32_t );
+            profiler_global_state.platform_data.linux_.mult = *( uint32_t* ) ( vdso_data + mult_offset );
+            profiler_global_state.platform_data.linux_.shift = *( uint32_t* ) ( vdso_data + shift_offset );
+        }
+    }
+    
+#else
+# error Unsupported platform.
+#endif
+    
+    profiler_global_state.is_initialized = 1;
+    
+    profiler_timeline_initialize_( id, main_thread_max_event_count, error );
+}
+
+profiler_initialize_t* profiler_initialize_function = profiler_initialize_;
+
+static void profiler_pair_check( void ) {
+    
+#if defined( PROFILER_DEBUG )
+    for ( uintptr_t timeline_index = 0; timeline_index < profiler_global_state.timeline_count; timeline_index++ ) {
+        
+        profiler_timeline_t* timeline = profiler_global_state.timelines + timeline_index;
+        
+        for ( uintptr_t id = 0; id < profiler_event_id_count; id++ ) {
+            // profiler_event_id_strings[ id ];
+            profiler_assert( timeline->pair_check[ id ] == 0 );
+        }
+    }
+#endif
+    
+}
+
+void profiler_finalize_no_op( void ) {
+}
+
+void profiler_finalize_( void ) {
+    
+    profiler_assert( profiler_global_state.is_initialized );
+    
+    uint64_t cycles = profiler_get_cycles( );
+    uint64_t time;
+    profiler_get_time( &time );
+    
+    profiler_global_state.fallback_cycles = cycles - profiler_global_state.fallback_cycles;
+    profiler_global_state.fallback_time = time - profiler_global_state.fallback_time;
+    
+    profiler_pair_check( );
+}
+
+profiler_finalize_t* profiler_finalize_function = profiler_finalize_;
+
+void profiler_cleanup_no_op( void ) {
+}
+
+void profiler_cleanup_( void ) {
+    
+    for ( uintptr_t i = 0; i < profiler_global_state.timeline_count; i++ ) {
+        
+        profiler_timeline_t* timeline = profiler_global_state.timelines + i;
+        
+        if ( timeline->start && timeline->end ) {
+            
+            uintptr_t size = ( uint8_t* ) timeline->end - ( uint8_t* ) timeline->start;
+            profiler_free_memory( timeline->start, size );
+            timeline->start = timeline->end = timeline->current = 0;
+            
+#if defined( PROFILER_DEBUG )
+            profiler_assert( timeline->pair_check );
+            profiler_free_memory( timeline->pair_check, sizeof( uint32_t ) * profiler_event_id_count );
+#endif
+        }
+    }
+}
+
+profiler_cleanup_t* profiler_cleanup_function = profiler_cleanup_;
+
+void profiler_timeline_set_id_for_index_( uint32_t id, uintptr_t index ) {
+    
+    if ( index < profiler_array_count( profiler_global_state.timelines ) ) {
+        profiler_global_state.timelines[ index ].id = id;
+    }
+}
+
+void profiler_timeline_set_id_( uint32_t id ) {
+    
+    if ( profiler_timeline ) {
+        profiler_timeline->id = id;
+    }
+}
+
+profiler_event_t* profiler_event_no_op( profiler_event_id_t id, uint32_t flags ) {
+    return 0;
+}
+
+profiler_event_t* profiler_collapsable_no_op( profiler_event_id_t id ) {
+    return 0;
+}
+
+profiler_event_t* profiler_event_start_( profiler_event_id_t id, uint32_t flags ) {
+    
+#if defined( PROFILER_DEBUG )
+    profiler_timeline->pair_check[ id ]++;
+#endif
+    
+    profiler_assert( profiler_timeline->current < profiler_timeline->end );
+    
+    profiler_event_t* event = profiler_timeline->current++;
+    event->id = id;
+    event->flags = flags;
+    event->cycles = profiler_get_cycles( );
+    
+    return event;
+}
+
+profiler_event_t* profiler_event_end_( profiler_event_id_t id, uint32_t flags ) {
+    
+    uint64_t cycles = profiler_get_cycles( );
+    
+    profiler_assert( profiler_timeline->current < profiler_timeline->end );
+    
+    profiler_event_t* event = profiler_timeline->current++;
+    event->id = id;
+    event->flags = flags;
+    event->cycles = cycles;
+    
+#if defined( PROFILER_DEBUG )
+    profiler_timeline->pair_check[ id ]--;
+#endif
+    
+    return event;
+}
+
+profiler_event_t* profiler_collapsable_start_( profiler_event_id_t name ) {
+    
+    profiler_assert( !profiler_timeline->in_collapsable_event );
+    profiler_timeline->in_collapsable_event = 1;
+    
+    if ( profiler_timeline->collapsable_index >= profiler_array_count( profiler_timeline->collapsable_end ) ) {
+        
+        profiler_event_start( profiler_collapse );
+        
+        uintptr_t index = profiler_timeline->collapsable_index % profiler_array_count( profiler_timeline->collapsable_end );
+        profiler_event_t* destination = profiler_timeline->collapsable_start[ index ];
+        profiler_event_t* source = profiler_timeline->collapsable_end[ index ];
+        
+        destination->flags |= profiler_event_flag_collapsed;
+        source->flags |= profiler_event_flag_collapsed;
+        
+        destination++;
+        
+        uintptr_t count = profiler_timeline->current - source;
+        uintptr_t size = count * sizeof( profiler_event_t );
+        profiler_memory_copy_aligned_16( destination, source, size );
+        profiler_timeline->current = destination + count;
+        
+        uintptr_t offset = source - destination;
+        
+        for ( uintptr_t i = 0; i < profiler_array_count( profiler_timeline->collapsable_start ); i++ ) {
+            profiler_timeline->collapsable_start[ i ] = profiler_timeline->collapsable_start[ i ] - offset;
+            profiler_timeline->collapsable_end[ i ] = profiler_timeline->collapsable_end[ i ] - offset;
+        }
+        
+        profiler_event_end( profiler_collapse );
+    }
+    
+    uintptr_t index = profiler_timeline->collapsable_index % profiler_array_count( profiler_timeline->collapsable_start );
+    profiler_timeline->collapsable_start[ index ] = profiler_event_start_( name, profiler_event_flag_start | profiler_event_flag_collapsable );
+    
+    return profiler_timeline->collapsable_start[ index ];
+}
+
+profiler_event_t* profiler_collapsable_end_( profiler_event_id_t name ) {
+    
+    uintptr_t index = profiler_timeline->collapsable_index % profiler_array_count( profiler_timeline->collapsable_end );
+    profiler_timeline->collapsable_end[ index ] = profiler_event_end_( name, profiler_event_flag_end | profiler_event_flag_collapsable );
+    
+    profiler_timeline->collapsable_index++;
+    
+    profiler_assert( profiler_timeline->in_collapsable_event );
+    profiler_timeline->in_collapsable_event = 0;
+    
+    return profiler_timeline->collapsable_end[ index ];
+}
+
+void profiler_enable_for_timeline_index( uint32_t index, profiler_enable_flag_t flags ) {
+    
+    if ( index < profiler_global_state.timeline_count ) {
+        
+        profiler_timeline_t* timeline = profiler_global_state.timelines + index;
+        
+        if ( !flags || ( flags & profiler_enable_event ) ) {
+            timeline->event_start_function = profiler_event_start_;
+            timeline->event_end_function = profiler_event_end_;
+        }
+        
+        if ( !flags || ( flags & profiler_enable_collapsable ) ) {
+            timeline->collapsable_start_function = profiler_collapsable_start_;
+            timeline->collapsable_end_function = profiler_collapsable_end_;
+        }
+    }
+}
+
+void profiler_disable_for_timeline_index( uint32_t index, profiler_enable_flag_t flags ) {
+    
+    if ( index < profiler_global_state.timeline_count ) {
+        
+        profiler_timeline_t* timeline = profiler_global_state.timelines + index;
+        
+        if ( !flags || ( flags & profiler_enable_event ) ) {
+            timeline->event_start_function = profiler_event_no_op;
+            timeline->event_end_function = profiler_event_no_op;
+        }
+        
+        if ( !flags || ( flags & profiler_enable_collapsable ) ) {
+            timeline->collapsable_start_function = profiler_collapsable_no_op;
+            timeline->collapsable_end_function = profiler_collapsable_no_op;
+        }
+    }
+}
+
+void profiler_enable_for_current_timeline( profiler_enable_flag_t flags ) {
+    
+    if ( !flags || ( flags & profiler_enable_event ) ) {
+        profiler_timeline->event_start_function = profiler_event_start_;
+        profiler_timeline->event_end_function = profiler_event_end_;
+    }
+    
+    if ( !flags || ( flags & profiler_enable_collapsable ) ) {
+        profiler_timeline->collapsable_start_function = profiler_collapsable_start_;
+        profiler_timeline->collapsable_end_function = profiler_collapsable_end_;
+    }
+}
+
+void profiler_disable_for_current_timeline( profiler_enable_flag_t flags ) {
+    
+    if ( !flags || ( flags & profiler_enable_event ) ) {
+        profiler_timeline->event_start_function = profiler_event_no_op;
+        profiler_timeline->event_end_function = profiler_event_no_op;
+    }
+    
+    if ( !flags || ( flags & profiler_enable_collapsable ) ) {
+        profiler_timeline->collapsable_start_function = profiler_collapsable_no_op;
+        profiler_timeline->collapsable_end_function = profiler_collapsable_no_op;
+    }
+}
+
+void profiler_enable_for_all_timelines( profiler_enable_flag_t flags ) {
+    
+    for ( uintptr_t i = 0; i < profiler_global_state.timeline_count; i++ ) {
+        
+        profiler_timeline_t* timeline = profiler_global_state.timelines + i;
+        
+        if ( !flags || ( flags & profiler_enable_event ) ) {
+            timeline->event_start_function = profiler_event_start_;
+            timeline->event_end_function = profiler_event_end_;
+        }
+        
+        if ( !flags || ( flags & profiler_enable_collapsable ) ) {
+            timeline->collapsable_start_function = profiler_collapsable_start_;
+            timeline->collapsable_end_function = profiler_collapsable_end_;
+        }
+    }
+}
+
+void profiler_disable_for_all_timelines( profiler_enable_flag_t flags ) {
+    
+    for ( uintptr_t i = 0; i < profiler_global_state.timeline_count; i++ ) {
+        
+        profiler_timeline_t* timeline = profiler_global_state.timelines + i;
+        
+        if ( !flags || ( flags & profiler_enable_event ) ) {
+            timeline->event_start_function = profiler_event_no_op;
+            timeline->event_end_function = profiler_event_no_op;
+        }
+        
+        if ( !flags || ( flags & profiler_enable_collapsable ) ) {
+            timeline->collapsable_start_function = profiler_collapsable_no_op;
+            timeline->collapsable_end_function = profiler_collapsable_no_op;
+        }
+    }
+}
+
+void profiler_disable( void ) {
+    profiler_initialize_function = profiler_initialize_disabled;
+    profiler_timeline_initialize_function = profiler_timeline_initialize_disabled;
+    profiler_finalize_function = profiler_finalize_no_op;
+    profiler_cleanup_function = profiler_cleanup_no_op;
+}
+
+void* profiler_events_get_next( uintptr_t* size ) {
+    
+    void* result = 0;
+    *size = 0;
+    
+    if ( profiler_global_state.events_get_index < profiler_global_state.timeline_count ) {
+        profiler_timeline_t* timeline = profiler_global_state.timelines + profiler_global_state.events_get_index;
+        result = ( void* ) timeline->start;
+        *size = ( ( uint8_t* ) timeline->current - ( uint8_t* ) timeline->start );
+        profiler_global_state.events_get_index++;
+    }
+    
+    return result;
+}
+
+void* profiler_events_get_first( uintptr_t* size ) {
+    profiler_global_state.events_get_index = 0;
+    void* result = profiler_events_get_next( size );
+    return result;
+}
+
+typedef enum profiler_meta_t {
+    
+    profiler_meta_timeline_id_count,
+    profiler_meta_timeline_count,
+    profiler_meta_event_id_count,
+    profiler_meta_timeline_id_string_buffer_size,
+    profiler_meta_event_id_string_buffer_size,
+    
+    profiler_meta_timeline_id_string_lengths,
+    profiler_meta_timeline_id_string_bytes,
+    
+    profiler_meta_timeline_sizes_in_bytes,
+    profiler_meta_timeline_ids,
+    
+    profiler_meta_event_id_string_lengths,
+    profiler_meta_event_id_string_bytes,
+    
+    profiler_meta_timing_frequency,
+    profiler_meta_timing_fallback_cycles,
+    profiler_meta_timing_fallback_time,
+    profiler_meta_timing_platform,
+    
+    profiler_meta_windows_version,
+    profiler_meta_windows_qpc_shift,
+    profiler_meta_windows_qpc_bias,
+    profiler_meta_windows_mul128,
+    profiler_meta_windows_add,
+    
+    profiler_meta_linux_mult,
+    profiler_meta_linux_shift,
+    
+    profiler_meta_count
+        
+} profiler_meta_t;
+
+void* profiler_meta_get_from_session( uintptr_t* size, uint32_t* error ) {
+    
+    uint64_t sizes[ profiler_meta_count ] = { 0 };
+    
+    sizes[ profiler_meta_timeline_id_count ] = sizeof( uint32_t );
+    sizes[ profiler_meta_timeline_count ] = sizeof( uint32_t );
+    sizes[ profiler_meta_event_id_count ] = sizeof( uint32_t );
+    sizes[ profiler_meta_timeline_id_string_buffer_size ] = sizeof( uint64_t );
+    sizes[ profiler_meta_event_id_string_buffer_size ] = sizeof( uint64_t );
+    
+    sizes[ profiler_meta_timeline_id_string_lengths ] = sizeof( uint16_t ) * profiler_timeline_id_count;
+    
+    for ( uintptr_t i = 0; i < profiler_timeline_id_count; i++ ) {
+        sizes[ profiler_meta_timeline_id_string_bytes ] += sizeof( uint8_t ) * profiler_timeline_id_string_lengths[ i ];
+    }
+    
+    sizes[ profiler_meta_timeline_sizes_in_bytes ] = sizeof( uint64_t ) * profiler_global_state.timeline_count;
+    sizes[ profiler_meta_timeline_ids ] = sizeof( uint32_t ) * profiler_global_state.timeline_count;
+    
+    sizes[ profiler_meta_event_id_string_lengths ] = sizeof( uint16_t ) * profiler_event_id_count;
+    
+    for ( uintptr_t i = 0; i < profiler_event_id_count; i++ ) {
+        sizes[ profiler_meta_event_id_string_bytes ] += sizeof( uint8_t ) * profiler_event_id_string_lengths[ i ];
+    }
+    
+    sizes[ profiler_meta_timing_frequency ] = sizeof( uint64_t );
+    sizes[ profiler_meta_timing_fallback_cycles ] = sizeof( uint64_t );
+    sizes[ profiler_meta_timing_fallback_time ] = sizeof( uint64_t );
+    sizes[ profiler_meta_timing_platform ] = sizeof( uint8_t );
+    
+    sizes[ profiler_meta_windows_version ] = sizeof( uint8_t );
+    sizes[ profiler_meta_windows_qpc_shift ] = sizeof( uint8_t );
+    sizes[ profiler_meta_windows_qpc_bias ] = sizeof( uint64_t );
+    sizes[ profiler_meta_windows_mul128 ] = sizeof( uint64_t );
+    sizes[ profiler_meta_windows_add ] = sizeof( uint64_t );
+    
+    sizes[ profiler_meta_linux_mult ] = sizeof( uint32_t );
+    sizes[ profiler_meta_linux_shift ] = sizeof( uint32_t );
+    
+    profiler_buffer_t buffer = { 0 };
+    *size = 0;
+    
+    for ( uintptr_t i = 0; i < profiler_meta_count; i++ ) {
+        profiler_assert( sizes[ i ] );
+        ( *size ) += sizes[ i ];
+    }
+    
+    void* memory = profiler_get_memory( *size );
+    
+    if ( memory ) {
+        buffer = profiler_buffer_make( *size, 0, memory, error );
+    } else {
+        profiler_set_error( error, profiler_error_get_memory_failed );
+    }
+    
+    if ( profiler_no_error( error ) ) {
+        
+        profiler_buffer_write_u32( &buffer, profiler_global_state.timeline_id_count, error );
+        profiler_buffer_write_u32( &buffer, profiler_global_state.timeline_count, error );
+        profiler_buffer_write_u32( &buffer, profiler_event_id_count, error );
+        profiler_buffer_write_u64( &buffer, sizes[ profiler_meta_timeline_id_string_bytes ], error );
+        profiler_buffer_write_u64( &buffer, sizes[ profiler_meta_event_id_string_bytes ], error );
+        
+        for ( uintptr_t i = 0; i < profiler_timeline_id_count; i++ ) {
+            profiler_buffer_write_u16( &buffer, profiler_timeline_id_string_lengths[ i ], error );
+        }
+        
+        for ( uintptr_t i = 0; i < profiler_timeline_id_count; i++ ) {
+            profiler_buffer_write_size( &buffer, profiler_timeline_id_string_lengths[ i ], ( char* ) profiler_timeline_id_strings[ i ], error );
+        }
+        
+        for ( uintptr_t i = 0; i < profiler_global_state.timeline_count; i++ ) {
+            profiler_timeline_t* timeline = profiler_global_state.timelines + i;
+            uint64_t timeline_size = ( ( uint8_t* ) timeline->current - ( uint8_t* ) timeline->start );
+            profiler_buffer_write_u64( &buffer, timeline_size, error );
+        }
+        
+        for ( uintptr_t i = 0; i < profiler_global_state.timeline_count; i++ ) {
+            profiler_timeline_t* timeline = profiler_global_state.timelines + i;
+            profiler_buffer_write_u32( &buffer, timeline->id, error );
+        }
+        
+        for ( uintptr_t i = 0; i < profiler_event_id_count; i++ ) {
+            profiler_buffer_write_u16( &buffer, profiler_event_id_string_lengths[ i ], error );
+        }
+        
+        for ( uintptr_t i = 0; i < profiler_event_id_count; i++ ) {
+            profiler_buffer_write_size( &buffer, profiler_event_id_string_lengths[ i ], ( char* ) profiler_event_id_strings[ i ], error );
+        }
+        
+        profiler_buffer_write_u64( &buffer, profiler_global_state.frequency, error );
+        profiler_buffer_write_u64( &buffer, profiler_global_state.fallback_cycles, error );
+        profiler_buffer_write_u64( &buffer, profiler_global_state.fallback_time, error );
+        profiler_buffer_write_u8( &buffer, profiler_global_state.platform, error );
+        
+        profiler_buffer_write_u8( &buffer, profiler_global_state.platform_data.windows.version, error );
+        profiler_buffer_write_u8( &buffer, profiler_global_state.platform_data.windows.qpc_shift, error );
+        profiler_buffer_write_u64( &buffer, profiler_global_state.platform_data.windows.qpc_bias, error );
+        profiler_buffer_write_u64( &buffer, profiler_global_state.platform_data.windows.mul128, error );
+        profiler_buffer_write_u64( &buffer, profiler_global_state.platform_data.windows.add, error );
+        
+        profiler_buffer_write_u32( &buffer, profiler_global_state.platform_data.linux_.mult, error );
+        profiler_buffer_write_u32( &buffer, profiler_global_state.platform_data.linux_.shift, error );
+        
+        profiler_assert( buffer.used == buffer.reserved );
+        profiler_assert( profiler_no_error( error ) );
+    }
+    
+    return ( void* ) buffer.bytes;
+}
+
+void profiler_tool_initialize_meta_from_session( profiler_tool_t* tool, uint32_t* error ) {
+    
+    if ( profiler_no_error( error ) ) {
+        
+        tool->timeline_id_count = profiler_global_state.timeline_id_count;
+        tool->timeline_count = profiler_global_state.timeline_count;
+        tool->event_id_count = profiler_event_id_count;
+        
+        uintptr_t timeline_id_string_buffer_size = 0;
+        
+        for ( uintptr_t i = 0; i < profiler_timeline_id_count; i++ ) {
+            timeline_id_string_buffer_size += sizeof( uint8_t ) * profiler_timeline_id_string_lengths[ i ];
+        }
+        
+        uintptr_t event_id_string_buffer_size = 0;
+        
+        for ( uintptr_t i = 0; i < profiler_event_id_count; i++ ) {
+            event_id_string_buffer_size += sizeof( uint8_t ) * profiler_event_id_string_lengths[ i ];
+        }
+        
+        tool->memory.reserved =
+            tool->timeline_id_count * ( sizeof( uint16_t ) + sizeof( uint8_t* ) ) + timeline_id_string_buffer_size
+            + tool->timeline_count * ( sizeof( uint64_t ) + sizeof( uint32_t ) + sizeof( profiler_node_t** ) )
+            + tool->timeline_count * sizeof( profiler_buffer_t )
+            + tool->event_id_count * ( sizeof( uint16_t ) + sizeof( uint8_t* ) ) + event_id_string_buffer_size
+            + tool->timeline_count * sizeof( profiler_totals_t );
+        tool->memory.used =  0;
+        tool->memory.bytes = ( uint8_t* ) profiler_get_memory( tool->memory.reserved );
+        
+        if ( !tool->memory.bytes ) {
+            profiler_set_error( error, profiler_error_get_memory_failed );
+        } else {
+            
+            tool->timeline_id_string_lengths = profiler_buffer_push_array( &tool->memory, uint16_t, tool->timeline_id_count, error );
+            profiler_memory_copy_2( tool->timeline_id_string_lengths, profiler_timeline_id_string_lengths, sizeof( uint16_t ) * tool->timeline_id_count );
+            tool->timeline_id_strings = profiler_buffer_push_array( &tool->memory, uint8_t*, tool->timeline_id_count, error );
+            
+            for ( uintptr_t i = 0; i < tool->timeline_id_count; i++ ) {
+                
+                uint16_t length = tool->timeline_id_string_lengths[ i ];
+                tool->timeline_id_strings[ i ] = ( uint8_t* ) profiler_buffer_push_size( &tool->memory, length, error );
+                profiler_memory_copy( tool->timeline_id_strings[ i ], ( char* ) profiler_timeline_id_strings[ i ], length );
+                
+                if ( length > tool->max_timeline_id_string_length ) {
+                    tool->max_timeline_id_string_length = length;
+                }
+            }
+            
+            tool->timeline_sizes = profiler_buffer_push_array( &tool->memory, uint64_t, tool->timeline_count, error );
+            tool->timeline_ids = profiler_buffer_push_array( &tool->memory, uint32_t, tool->timeline_count, error );
+            
+            for ( uintptr_t i = 0; i < tool->timeline_count; i++ ) {
+                profiler_timeline_t* timeline = profiler_global_state.timelines + i;
+                uint64_t timeline_size = ( ( uint8_t* ) timeline->current - ( uint8_t* ) timeline->start );
+                tool->timeline_sizes[ i ] = timeline_size;
+                
+                tool->timeline_ids[ i ] = timeline->id;
+            }
+            
+            tool->event_id_string_lengths = profiler_buffer_push_array( &tool->memory, uint16_t, tool->event_id_count, error );
+            profiler_memory_copy_2( tool->event_id_string_lengths, profiler_event_id_string_lengths, sizeof( uint16_t ) * tool->event_id_count );
+            tool->event_id_strings = profiler_buffer_push_array( &tool->memory, uint8_t*, tool->event_id_count, error );
+            
+            for ( uintptr_t i = 0; i < tool->event_id_count; i++ ) {
+                
+                uint16_t length = tool->event_id_string_lengths[ i ];
+                tool->event_id_strings[ i ] = ( uint8_t* ) profiler_buffer_push_size( &tool->memory, length, error );
+                profiler_memory_copy( tool->event_id_strings[ i ], ( char* ) profiler_event_id_strings[ i ], length );
+                
+                if ( length > tool->max_event_id_string_length ) {
+                    tool->max_event_id_string_length = length;
+                }
+            }
+            
+            tool->frequency = profiler_global_state.frequency;
+            tool->fallback_cycles = profiler_global_state.fallback_cycles;
+            tool->fallback_time = profiler_global_state.fallback_time;
+            tool->platform = profiler_global_state.platform;
+            
+            tool->platform_data.windows.version = profiler_global_state.platform_data.windows.version;
+            tool->platform_data.windows.qpc_shift = profiler_global_state.platform_data.windows.qpc_shift;
+            tool->platform_data.windows.qpc_bias = profiler_global_state.platform_data.windows.qpc_bias;
+            tool->platform_data.windows.mul128 = profiler_global_state.platform_data.windows.mul128;
+            tool->platform_data.windows.add = profiler_global_state.platform_data.windows.add;
+            
+            tool->platform_data.linux_.mult = profiler_global_state.platform_data.linux_.mult;
+            tool->platform_data.linux_.shift = profiler_global_state.platform_data.linux_.shift;
+            
+            tool->timelines = ( profiler_node_t** ) profiler_buffer_push_array( &tool->memory, profiler_node_t*, tool->timeline_count, error );
+            tool->totals = ( profiler_totals_t* ) profiler_buffer_push_array( &tool->memory, profiler_totals_t, tool->timeline_count, error );
+            tool->timelines_memory = ( profiler_buffer_t* ) profiler_buffer_push_array( &tool->memory, profiler_buffer_t, tool->timeline_count, error );
+            
+            profiler_buffer_t memory = { 0 };
+            profiler_totals_t totals = { 0 };
+            
+            for ( uintptr_t i = 0; i < tool->timeline_count; i++ ) {
+                tool->timelines[ i ] = 0;
+                tool->timelines_memory[ i ] = memory;
+                tool->totals[ i ] = totals;
+            }
+            
+            profiler_assert( tool->memory.used == tool->memory.reserved );
+            profiler_assert( profiler_no_error( error ) );
+            
+            tool->print_event_id_width = ( tool->max_event_id_string_length < 40 ) ? 40 : tool->max_event_id_string_length;
+            tool->indent_space_count = 2;
+        }
+    }
+}
+
+profiler_tool_t profiler_tool_initialize_from_session( void* user_data_init, uintptr_t user_data_size, uint32_t* error ) {
+    
+    profiler_tool_t tool = { 0 };
+    
+    profiler_tool_initialize_meta_from_session( &tool, error );
+    
+    if ( profiler_no_error( error ) ) {
+        
+        profiler_assert( tool.timelines );
+        
+        uintptr_t events_size = 0;
+        void* events = profiler_events_get_first( &events_size );
+        
+        uintptr_t i = 0;
+        
+        while ( profiler_no_error( error ) && events ) {
+            tool.timelines[ i ] = profiler_build_tree( &tool, events, events_size, user_data_init, user_data_size, tool.timelines_memory + i, tool.totals + i, error );
+            events = profiler_events_get_next( &events_size );
+            i++;
+        }
+        
+        profiler_assert( events == 0 );
+        profiler_assert( events_size == 0 );
+        profiler_assert( i == tool.timeline_count );
+        
+        profiler_internal_tool_initialize_print_sizes( &tool );
+    }
+    
+    return tool;
+}
+
+uintptr_t profiler_print_from_session( void* buffer, uintptr_t size, uint32_t* error ) {
+    
+    profiler_buffer_t out = profiler_buffer_make( size, 0, buffer, error );
+    profiler_tool_t tool = profiler_tool_initialize_from_session( 0, 0, error );
+    tool.print_time_integer_size = 3;
+    
+    for ( uintptr_t timeline_index = 0; profiler_no_error( error ) && timeline_index < tool.timeline_count; timeline_index++ ) {
+        
+        uintptr_t used = profiler_print_timeline( &tool, timeline_index, out.bytes + out.used, out.reserved - out.used, error );
+        out.used += used;
+        profiler_buffer_push_string_l( &out, "\n----------------------------------------------------------------------------------------------------\n", error );
+    }
+    
+    profiler_tool_free_memory( &tool );
+    
+    return out.used;
+}
+
+typedef struct profiler_file_header_t {
+    uint32_t signature;
+    uint32_t version;
+    uint64_t meta_size;
+    uint64_t meta_offset;
+    uint64_t timelines_size;
+    uint64_t timelines_offset;
+} profiler_file_header_t;
+
+#if defined( PROFILER_WINDOWS )
+
+profiler_ctassert( sizeof( uint32_t ) == sizeof( unsigned long ) );
+
+typedef void* profiler_WINDOWS_HANDLE;
+typedef struct _SECURITY_ATTRIBUTES SECURITY_ATTRIBUTES;
+typedef struct _OVERLAPPED OVERLAPPED;
+
+#define profiler_INVALID_HANDLE_VALUE ( ( profiler_WINDOWS_HANDLE )( long* ) -1 )
+#define profiler_GENERIC_WRITE ( 0x40000000L )
+#define profiler_CREATE_NEW 1
+#define profiler_CREATE_ALWAYS 2
+
+profiler_extern_c __declspec( dllimport ) profiler_WINDOWS_HANDLE CreateFileA( const char* lpFileName,
+                                                                              unsigned long dwDesiredAccess,
+                                                                              unsigned long dwShareMode,
+                                                                              SECURITY_ATTRIBUTES* lpSecurityAttributes,
+                                                                              unsigned long dwCreationDisposition,
+                                                                              unsigned long dwFlagsAndAttributes,
+                                                                              profiler_WINDOWS_HANDLE hTemplateFile );
+
+profiler_extern_c __declspec( dllimport ) int WriteFile( profiler_WINDOWS_HANDLE hFile,
+                                                        const void* lpBuffer,
+                                                        unsigned long nNumberOfBytesToWrite,
+                                                        unsigned long* lpNumberOfBytesWritten,
+                                                        OVERLAPPED* lpOverlapped );
+
+profiler_extern_c __declspec( dllimport ) int CloseHandle( profiler_WINDOWS_HANDLE hObject );
+
+static uint64_t profiler_internal_write_to_file( profiler_WINDOWS_HANDLE handle, void* data, uintptr_t size, uint32_t* error ) {
+    
+    uint64_t total_written = 0;
+    uint32_t bytes_written = 0;
+    uint32_t to_write = ( uint32_t ) ( ( size > 0xffffffff ) ? 0xffffffff : size );
+    
+    while ( profiler_no_error( error ) && total_written < size ) {
+        
+        if ( !WriteFile( handle, ( uint8_t* ) data + total_written, to_write, ( unsigned long* ) &bytes_written, 0 ) ) {
+            profiler_set_error( error, profiler_error_file_writing_failed );
+        } else {
+            total_written += bytes_written;
+            to_write = ( uint32_t ) ( ( ( size - total_written ) > 0xffffffff ) ? 0xffffffff : ( size - total_written ) );
+        }
+    }
+    
+    if ( profiler_no_error( error ) && total_written != size ) {
+        profiler_set_error( error, profiler_error_file_writing_incomplete );
+    }
+    
+    return total_written;
+}
+
+uint64_t profiler_write_to_file( void* file_name, uint32_t overwrite, uint32_t* error ) {
+    
+    uint64_t file_size = 0;
+    
+    if ( profiler_no_error( error ) ) {
+        
+        profiler_WINDOWS_HANDLE file = CreateFileA( ( const char* ) file_name, profiler_GENERIC_WRITE, 0, 0, ( overwrite ) ? profiler_CREATE_ALWAYS : profiler_CREATE_NEW, 0, 0 );
+        
+        if ( file == profiler_INVALID_HANDLE_VALUE ) {
+            profiler_set_error( error, profiler_error_file_creation_failed );
+        } else {
+            
+            profiler_file_header_t header = { 0 };
+            header.signature = ( 'P' ) | ( 'R' << 8 ) | ( 'O' << 16 ) | ( 'F' << 24 );
+            header.version = 1;
+            
+            void* meta = profiler_meta_get_from_session( &header.meta_size, error );
+            header.meta_offset = sizeof( profiler_file_header_t );
+            
+            uint64_t events_size = 0;
+            void* events = profiler_events_get_first( &events_size );
+            
+            while ( events ) {
+                header.timelines_size += events_size;
+                events = profiler_events_get_next( &events_size );
+            }
+            
+            uint64_t current_offset = ( uint64_t ) ( header.meta_offset + header.meta_size );
+            uint32_t padding = profiler_get_padding( ( void* ) current_offset, 16 );
+            header.timelines_offset = current_offset + padding;
+            
+            file_size += profiler_internal_write_to_file( file, &header, sizeof( header ), error );
+            file_size += profiler_internal_write_to_file( file, meta, header.meta_size, error );
+            uint8_t padding_bytes[ 16 ] = { 0 };
+            file_size += profiler_internal_write_to_file( file, padding_bytes, padding, error );
+            
+            events = profiler_events_get_first( &events_size );
+            
+            while ( profiler_no_error( error ) && events && events_size ) {
+                
+                /* NOTE simon: make sure there is a even number of events. Ideally we should make sure all events are closed. */
+                profiler_assert( ( events_size % ( sizeof( profiler_event_t ) * 2 ) ) == 0 );
+                
+                file_size += profiler_internal_write_to_file( file, events, events_size, error );
+                events = profiler_events_get_next( &events_size );
+            }
+            
+            CloseHandle( file );
+            
+            if ( meta ) {
+                profiler_free_memory( meta, header.meta_size );
+                meta = 0;
+            }
+        }
+    }
+    
+    return file_size;
+}
+
+#elif defined( PROFILER_LINUX )
+
+typedef unsigned short profiler_mode_t;
+
+#if defined( __amd64__ ) || defined( __amd64 ) || defined( __x86_64__ ) || defined( __x86_64 )
+
+profiler_ctassert( sizeof( long ) == 8 );
+typedef long ssize_t;
+typedef unsigned long size_t;
+#define profiler_SSIZE_MAX 0x7fffffffffffffff
+
+#else
+
+profiler_ctassert( sizeof( int ) == 4 );
+typedef int ssize_t;
+typedef unsigned int size_t;
+#define profiler_SSIZE_MAX 0x7fffffff
+
+#endif
+
+/* NOTE simon: was int open( const char *pathname, int flags, profiler_mode_t mode ); */
+profiler_extern_c int open( const char *pathname, int flags, ... );
+profiler_extern_c ssize_t write( int fd, const void *buf, size_t count );
+profiler_extern_c int close( int fd );
+
+/* NOTE simon: from /usr/incule/bits/fcntl-linux.h */
+
+/* NOTE simon: converted octal values */
+#define profiler_O_WRONLY 0x0001 /* 0001 */
+#define profiler_O_CREAT 0x0040 /* 0100 */
+#define profiler_O_EXCL 0x0080 /* 0200 */
+
+/* NOTE simon: from /usr/include/fcntl.h */
+/* NOTE simon: from /usr/include/bits/stat.h */
+#define profiler_S_IRUSR 0x0100 /* 0400 */
+#define profiler_S_IWUSR 0x0080 /* 0200 */
+#define profiler_S_IRGRP ( profiler_S_IRUSR >> 3 )
+#define profiler_S_IWGRP ( profiler_S_IWUSR >> 3 )
+#define profiler_S_IROTH ( profiler_S_IRGRP >> 3 )
+
+static uint64_t profiler_internal_write_to_file( int handle, void* data, uintptr_t size, uint32_t* error ) {
+    
+    uint64_t total_written = 0;
+    size_t to_write = ( size_t ) ( ( size > profiler_SSIZE_MAX ) ? profiler_SSIZE_MAX : size );
+    
+    while ( profiler_no_error( error ) && total_written < size ) {
+        
+        ssize_t bytes_written = write( handle, ( uint8_t* ) data + total_written, to_write );
+        
+        if ( bytes_written == -1 ) {
+            profiler_set_error( error, profiler_error_file_writing_failed );
+        } else {
+            total_written += bytes_written;
+            to_write = ( size_t ) ( ( ( size - total_written ) > profiler_SSIZE_MAX ) ? profiler_SSIZE_MAX : ( size - total_written ) );
+        }
+    }
+    
+    if ( total_written != size ) {
+        profiler_set_error( error, profiler_error_file_writing_incomplete );
+    }
+    
+    return total_written;
+}
+
+uint64_t profiler_write_to_file( void* file_name, uint32_t overwrite, uint32_t* error ) {
+    
+    uint64_t file_size = 0;
+    
+    if ( profiler_no_error( error ) ) {
+        
+        int flags = profiler_O_WRONLY | profiler_O_CREAT | ( overwrite ? 0 : profiler_O_EXCL );
+        profiler_mode_t mode = profiler_S_IRUSR | profiler_S_IWUSR | profiler_S_IRGRP | profiler_S_IWGRP | profiler_S_IROTH;
+        int handle = open( ( const char* ) file_name, flags, mode );
+        
+        if ( handle < 0 ) {
+            profiler_set_error( error, profiler_error_file_creation_failed );
+        } else {
+            
+            profiler_file_header_t header = { 0 };
+            header.signature = ( 'P' ) | ( 'R' << 8 ) | ( 'O' << 16 ) | ( 'F' << 24 );
+            header.version = 1;
+            
+            void* meta = profiler_meta_get_from_session( &header.meta_size, error );
+            header.meta_offset = sizeof( profiler_file_header_t );
+            
+            uint64_t events_size = 0;
+            void* events = profiler_events_get_first( &events_size );
+            
+            while ( events ) {
+                header.timelines_size += events_size;
+                events = profiler_events_get_next( &events_size );
+            }
+            
+            uint64_t current_offset = ( uint64_t ) ( header.meta_offset + header.meta_size );
+            uint32_t padding = profiler_get_padding( ( void* ) current_offset, 16 );
+            header.timelines_offset = current_offset + padding;
+            
+            file_size += profiler_internal_write_to_file( handle, &header, sizeof( header ), error );
+            file_size += profiler_internal_write_to_file( handle, meta, header.meta_size, error );
+            uint8_t padding_bytes[ 16 ] = { 0 };
+            file_size += profiler_internal_write_to_file( handle, padding_bytes, padding, error );
+            
+            events = profiler_events_get_first( &events_size );
+            
+            while ( profiler_no_error( error ) && events && events_size ) {
+                
+                /* NOTE simon: make sure there is a even number of events. Ideally we should make sure all events are closed. */
+                profiler_assert( ( events_size % ( sizeof( profiler_event_t ) * 2 ) ) == 0 );
+                
+                file_size += profiler_internal_write_to_file( handle, events, events_size, error );
+                events = profiler_events_get_next( &events_size );
+            }
+            
+            close( handle );
+            
+            if ( meta ) {
+                profiler_free_memory( meta, header.meta_size );
+                meta = 0;
+            }
+        }
+    }
+    
+    return file_size;
+}
+
+#else
+#error Unsupported platform.
+#endif
+
+#endif /* PROFILER_ON */
+
+#else /* PROFILER_IMPLEMENTATION*/
+
+#if defined( PROFILER_ON )
+extern profiler_state_t profiler_global_state;
+extern profiler_thread_local_storage profiler_timeline_t* profiler_timeline;
+#endif
+
+#endif /* PROFILER_IMPLEMENTATION*/
+
+#define PROFILER_H 1
+
+#endif
