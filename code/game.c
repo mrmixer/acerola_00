@@ -527,10 +527,10 @@ void game_run( window_t* window, gl_t* gl, u32* gl_error ) {
                 computer_set_error( indices[ 0 ], 2, direction_down, direction_right );
                 computer_set_error( indices[ 0 ], 3, direction_left, direction_right );
                 
-                computer_set_error( indices[ 2 ], 0, direction_up, direction_right );
-                computer_set_error( indices[ 2 ], 1, direction_right, direction_down );
-                computer_set_error( indices[ 2 ], 2, direction_down, direction_left );
-                computer_set_error( indices[ 2 ], 3, direction_left, direction_up );
+                computer_set_error( indices[ 1 ], 0, direction_up, direction_right );
+                computer_set_error( indices[ 1 ], 1, direction_right, direction_down );
+                computer_set_error( indices[ 1 ], 2, direction_down, direction_left );
+                computer_set_error( indices[ 1 ], 3, direction_left, direction_up );
                 
                 computer_set_error( indices[ 2 ], 0, direction_up, direction_right );
                 computer_set_error( indices[ 2 ], 1, direction_right, direction_down );
